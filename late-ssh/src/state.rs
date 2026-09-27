@@ -51,10 +51,10 @@ pub struct ActiveSession {
     pub token: String,
     pub fingerprint: Option<String>,
     pub peer_ip: Option<IpAddr>,
-    /// This session's `/status`, `None` when unset. The status directory's
-    /// per-user entry is rebuilt from these (`status::publish_for_user`), so
-    /// one session clearing or leaving cannot erase another session's badge.
-    pub status: Option<crate::app::common::status::SessionStatus>,
+    /// Whether this session is away (`app/common/away.rs`): quiet for the
+    /// away threshold or sent away by hand. A user reads as away only when
+    /// every one of their sessions is.
+    pub away: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,9 +72,8 @@ pub type ActiveUsers = Arc<Mutex<HashMap<Uuid, ActiveUser>>>;
 /// Connected humans only: the always-on bots (@bartender, @graybeard, @bot)
 /// register with no fingerprint and are excluded, matching the clubhouse
 /// headcount.
-pub fn online_human_count(active_users: &ActiveUsers) -> usize {
+pub fn online_human_count(active_users: &HashMap<Uuid, ActiveUser>) -> usize {
     active_users
-        .lock_recover()
         .values()
         .filter(|user| user.fingerprint.is_some())
         .count()
@@ -106,6 +105,7 @@ pub struct State {
     pub translation_service: crate::app::ai::translate::TranslationService,
     pub summary_service: crate::app::ai::summary::SummaryService,
     pub paper_service: crate::app::paper::svc::PaperService,
+    pub jobs_service: crate::app::jobs::svc::JobsService,
     pub audio_service: AudioService,
     pub voice_service: VoiceService,
     pub stream_service: crate::app::stream::svc::StreamService,
@@ -156,6 +156,9 @@ pub struct State {
     pub active_users: ActiveUsers,
     /// Process-global clubhouse presence: who sits where, who is walking.
     pub clubhouse_lobby: crate::app::clubhouse::lobby::SharedLobby,
+    /// Process-global Nightcap seats.
+    pub nightcap_lobby: crate::app::clubhouse::nightcap::lobby::SharedSeats,
+    pub nightcap_house: crate::app::clubhouse::nightcap::svc::NightcapHouse,
     /// Process-global ghost-bot mention cooldown ladders: ghost responder
     /// loops step them, sessions peek for the composer cooldown banner.
     pub mention_ladders: crate::app::ai::ladder::MentionLadders,
@@ -165,10 +168,6 @@ pub struct State {
     /// Live 24h username effects (snapshot-swap; seeded and written by
     /// `ShopService`, resolved per session in the tick loop).
     pub flair_directory: crate::app::common::username_effect::NameFlairDirectory,
-    /// Live `/status` presence (snapshot-swap; written by the sessions that
-    /// own them, resolved per session in the tick loop). In-memory only: a
-    /// status dies with its session, so there is nothing to persist.
-    pub status_directory: crate::app::common::status::StatusDirectory,
     pub crown_service: crate::app::crown::svc::CrownService,
     pub pot_service: crate::app::pot::svc::PotService,
     pub activity_feed: broadcast::Sender<ActivityEvent>,

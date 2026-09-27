@@ -411,6 +411,7 @@ fn wrap_message_author_tint_splits_only_the_username() {
         crown_range: None,
         range: (4, 9), // "alice" inside "★ alice 🌱" ("★" is 3 bytes)
         title_range: None,
+        runner: None,
         word: None,
         name_style: None,
     };
@@ -450,6 +451,7 @@ fn wrap_message_author_tint_ignores_bad_ranges() {
         crown_range: None,
         range: (0, 99),
         title_range: None,
+        runner: None,
         word: None,
         name_style: None,
     };
@@ -473,6 +475,7 @@ fn wrap_message_name_style_paints_per_char_over_author_style() {
         crown_range: None,
         range: (0, 5),
         title_range: None,
+        runner: None,
         word: None,
         name_style: Some(NameStyle::Solid(Color::Rgb(255, 200, 80))),
     };
@@ -511,6 +514,7 @@ fn wrap_message_prints_drunk_word_between_name_and_stamp() {
         crown_range: None,
         range: (0, 5),
         title_range: None,
+        runner: None,
         word: Some(("wasted", Color::Rgb(120, 40, 35))),
         name_style: None,
     };
@@ -547,6 +551,7 @@ fn wrap_message_omits_drunk_word_when_absent() {
         crown_range: None,
         range: (0, 5),
         title_range: None,
+        runner: None,
         word: None,
         name_style: None,
     };
@@ -571,4 +576,16 @@ fn composer_rows_soft_wrap_words() {
     let rows = build_composer_rows("hello wide world", 8);
     let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
     assert_eq!(texts, vec!["hello", "wide", "world"]);
+}
+
+#[test]
+fn nerd_font_glyphs_are_dropped_and_everything_else_kept() {
+    // BMP PUA (nf-dev-rust), supplementary PUA (nf-md), then emoji, box
+    // drawing and a flag that must all survive.
+    let text = "ship it \u{e7a8} now \u{f0001}! 🚀 ─ 🇵🇱";
+    assert_eq!(without_nerd_font_glyphs(text), "ship it  now ! 🚀 ─ 🇵🇱");
+    assert!(matches!(
+        without_nerd_font_glyphs("plain 🚀"),
+        std::borrow::Cow::Borrowed(_)
+    ));
 }

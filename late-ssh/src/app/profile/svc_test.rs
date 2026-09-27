@@ -17,7 +17,9 @@ use late_core::models::{
     chat_room::ChatRoom,
     chips::{ChipMove, INITIAL_CHIP_BALANCE, UserChips},
     crown::{CROWN_MIN_PRICE, CrownReign, next_price},
-    drink_round::{DrinkRound, MAX_OPEN_CREDITS, ROUND_CREDIT_TTL_HOURS, ROUND_PRICE_PER_PATRON},
+    drink_round::{
+        Bar, DrinkRound, MAX_OPEN_CREDITS, ROUND_CREDIT_TTL_HOURS, ROUND_PRICE_PER_PATRON,
+    },
     game_payout::GamePayout,
     media_queue_item::MediaQueueItem,
     moderation_audit_log::ModerationAuditLog,
@@ -25,6 +27,7 @@ use late_core::models::{
     profile::{Profile, ProfileParams},
     room_ban::RoomBan,
     server_ban::{ServerBan, ServerBanActivation},
+    showcase::{Showcase, ShowcaseParams},
     user::{RightSidebarMode, User, UserParams, default_right_sidebar_components},
 };
 use late_core::test_utils::create_test_user;
@@ -99,6 +102,111 @@ async fn find_profile_publishes_stored_chip_balance() {
 
     assert_eq!(snapshot.user_id, Some(user.id));
     assert_eq!(snapshot.chip_balance, Some(chips.balance));
+}
+
+/// The runner section reads the sheet as it would stand today, not as the
+/// row last left it: the lazy day roll is applied to the view, so a runner
+/// who dropped yesterday and has not touched the row since is not shown
+/// with a dead signal after midnight. Nothing is written.
+#[tokio::test]
+async fn find_profile_settles_the_runners_sheet_for_the_view() {
+    use crate::app::deadchannel::fight::data::RATIONS_PER_DAY;
+    use crate::app::deadchannel::fight::state::Sheet;
+    use crate::app::deadchannel::fight::svc::FightService;
+    use crate::app::deadchannel::runner::state::Look;
+    use late_core::models::deadchannel_runner::DeadchannelRunner;
+
+    let test_db = new_test_db().await;
+    let client = test_db.db.get().await.expect("db client");
+    let user = create_test_user(&test_db.db, "profile-runner-roll").await;
+    let look = Look::random(1, &mut rand::thread_rng());
+    DeadchannelRunner::ensure_for_user(&client, user.id, &look.to_json())
+        .await
+        .expect("a runner");
+    let row = DeadchannelRunner::find_by_user(&client, user.id)
+        .await
+        .expect("find runner")
+        .expect("runner row");
+    let mut yesterday = Sheet::from_row(&row).expect("sheet parses");
+    yesterday.day = FightService::today()
+        .pred_opt()
+        .expect("a day before today");
+    yesterday.signal = 0;
+    yesterday.rations_left = 0;
+    yesterday.kills_today = 3;
+    DeadchannelRunner::store_sheet(&**client, yesterday.to_write())
+        .await
+        .expect("store yesterday's sheet");
+
+    let service = ProfileService::new(test_db.db.clone(), default_active_users());
+    let mut snapshot_rx = service.subscribe_snapshot(user.id);
+    service.find_profile(user.id);
+    timeout(Duration::from_secs(2), snapshot_rx.changed())
+        .await
+        .expect("snapshot timeout")
+        .expect("watch changed");
+    let snapshot = snapshot_rx.borrow_and_update().clone();
+    let runner = snapshot.runner.expect("runner in snapshot");
+    assert_eq!(runner.look, look);
+    assert_eq!(runner.sheet.day, FightService::today());
+    assert_eq!(runner.sheet.signal, runner.sheet.max_signal());
+    assert_eq!(runner.sheet.rations_left, RATIONS_PER_DAY);
+    assert_eq!(runner.sheet.kills_today, 0);
+
+    // The view rolled; the row did not.
+    let stored = DeadchannelRunner::find_by_user(&client, user.id)
+        .await
+        .expect("find runner again")
+        .expect("runner row again");
+    assert_eq!(stored.signal, 0);
+    assert_eq!(stored.rations_left, 0);
+}
+
+/// The profile modal shows the viewed user's showcases from this snapshot,
+/// so it carries every one of theirs, newest first, and nobody else's.
+#[tokio::test]
+async fn find_profile_publishes_only_the_owners_showcases_newest_first() {
+    let test_db = new_test_db().await;
+    let client = test_db.db.get().await.expect("db client");
+    let owner = create_test_user(&test_db.db, "profile-showcase-owner").await;
+    let stranger = create_test_user(&test_db.db, "profile-showcase-stranger").await;
+    for (user_id, title) in [
+        (owner.id, "Older project"),
+        (stranger.id, "Someone else's project"),
+        (owner.id, "Newer project"),
+    ] {
+        Showcase::create_by_user_id(
+            &client,
+            user_id,
+            ShowcaseParams {
+                user_id,
+                title: title.to_string(),
+                url: "https://example.com/project".to_string(),
+                description: "A project.".to_string(),
+                tags: Vec::new(),
+            },
+        )
+        .await
+        .expect("create showcase");
+    }
+
+    let service = ProfileService::new(test_db.db.clone(), default_active_users());
+    let mut snapshot_rx = service.subscribe_snapshot(owner.id);
+
+    service.find_profile(owner.id);
+
+    timeout(Duration::from_secs(2), snapshot_rx.changed())
+        .await
+        .expect("snapshot timeout")
+        .expect("watch changed");
+    let snapshot = snapshot_rx.borrow_and_update().clone();
+
+    let titles: Vec<&str> = snapshot
+        .showcases
+        .iter()
+        .map(|showcase| showcase.title.as_str())
+        .collect();
+    assert_eq!(titles, ["Newer project", "Older project"]);
 }
 
 /// A gild in the viewed user's ledger comes with what the modal needs to
@@ -243,6 +351,7 @@ async fn find_profile_resolves_the_house_rows() {
         &tx,
         user.id,
         ROUND_PRICE_PER_PATRON,
+        Bar::Tavern,
         &[patron.id],
         ROUND_CREDIT_TTL_HOURS,
         MAX_OPEN_CREDITS,
@@ -409,6 +518,8 @@ async fn edit_profile_emits_saved_event_and_refreshes_snapshot() {
             start_with_music_muted: false,
             landing_page: late_core::models::user::LandingPage::Clubhouse,
             paper_at_login: true,
+            terminal_images: late_core::models::user::TerminalImagesMode::Auto,
+            hidden_award_categories: Vec::new(),
             show_flag_fallback: false,
             translate_to: late_core::models::message_translation::TranslateLang::En,
             auto_translate: false,
@@ -485,6 +596,8 @@ async fn edit_profile_normalizes_username_before_persisting() {
             start_with_music_muted: false,
             landing_page: late_core::models::user::LandingPage::Clubhouse,
             paper_at_login: true,
+            terminal_images: late_core::models::user::TerminalImagesMode::Auto,
+            hidden_award_categories: Vec::new(),
             show_flag_fallback: false,
             translate_to: late_core::models::message_translation::TranslateLang::En,
             auto_translate: false,
@@ -556,6 +669,8 @@ async fn edit_profile_preserves_unrelated_settings_keys() {
             start_with_music_muted: false,
             landing_page: late_core::models::user::LandingPage::Clubhouse,
             paper_at_login: true,
+            terminal_images: late_core::models::user::TerminalImagesMode::Auto,
+            hidden_award_categories: Vec::new(),
             show_flag_fallback: false,
             translate_to: late_core::models::message_translation::TranslateLang::En,
             auto_translate: false,
@@ -756,7 +871,7 @@ async fn delete_account_terminates_active_sessions() {
                 token,
                 fingerprint: Some(user.fingerprint.clone()),
                 peer_ip: None,
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: Instant::now(),
@@ -838,6 +953,8 @@ async fn edit_profile_snapshots_stay_per_user() {
             start_with_music_muted: false,
             landing_page: late_core::models::user::LandingPage::Clubhouse,
             paper_at_login: true,
+            terminal_images: late_core::models::user::TerminalImagesMode::Auto,
+            hidden_award_categories: Vec::new(),
             show_flag_fallback: false,
             translate_to: late_core::models::message_translation::TranslateLang::En,
             auto_translate: false,

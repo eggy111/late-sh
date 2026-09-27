@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use late_core::models::leaderboard::LeaderboardData;
 use late_core::models::profile::Profile;
-use late_core::models::user::{LandingPage, RightSidebarMode, RoomListMode};
+use late_core::models::user::{LandingPage, RightSidebarMode, RoomListMode, TerminalImagesMode};
 use late_core::models::user_ssh_key::KeyLayout;
 
 use crate::{
@@ -38,7 +38,6 @@ use crate::{
         chat::notifications::svc::NotificationService,
         chat::svc::ChatService,
         common::primitives::{Banner, Screen},
-        common::status::{SessionStatus, StatusDirectory},
         help_modal, hub, mod_modal, profile,
         profile::svc::ProfileService,
         profile_modal, settings_modal, sheet_modal,
@@ -209,6 +208,8 @@ pub struct SessionConfig {
     pub summary_service: crate::app::ai::summary::SummaryService,
     /// The Late Edition (`app/paper`): the newsstand this session reads from.
     pub paper_service: crate::app::paper::svc::PaperService,
+    /// The job feed (`app/jobs`): the shelf snapshot this session copies.
+    pub jobs_service: crate::app::jobs::svc::JobsService,
     pub notification_service: NotificationService,
     pub article_service: ArticleService,
     pub feed_service: crate::app::chat::feeds::svc::FeedService,
@@ -255,14 +256,20 @@ pub struct SessionConfig {
     pub dartboard_server: dartboard_local::ServerHandle,
     pub dartboard_provenance: crate::app::artboard::provenance::SharedArtboardProvenance,
     pub artboard_snapshot_service: crate::app::artboard::svc::ArtboardSnapshotService,
-    /// The Artboard gallery: listings, hanging, applause, the splash podium.
+    /// The Artboard gallery: listings, hanging, applause, the splash wall.
     pub gallery_service: crate::app::artboard::gallery::svc::GalleryService,
-    /// The podium piece this login shows over the door, claimed at
-    /// bootstrap (`GalleryService::claim_splash_piece`); `None` is the
-    /// coffee cup.
+    /// The wall piece this login shows over the door, read at bootstrap
+    /// (`GalleryService::splash_piece`); `None` is the coffee cup.
     pub splash_piece: Option<crate::app::artboard::gallery::svc::SplashPiece>,
     pub username: String,
     pub bonsai_service: crate::app::bonsai::svc::BonsaiService,
+    /// The runner's sheet writer (`app/deadchannel/fight`): the day roll
+    /// and the fight loop, one transaction per command.
+    pub fight_service: crate::app::deadchannel::fight::svc::FightService,
+    /// The look's writer after the join (`app/deadchannel/tailor`).
+    pub tailor_service: crate::app::deadchannel::tailor::svc::TailorService,
+    /// The first descent's claim (`app/deadchannel/guide`).
+    pub guide_service: crate::app::deadchannel::guide::svc::GuideService,
     pub initial_bonsai_tree: Option<late_core::models::bonsai::Tree>,
     pub initial_bonsai_decay_protection:
         Option<late_core::models::bonsai_decay_protection::BonsaiDecayProtection>,
@@ -357,6 +364,10 @@ pub struct SessionConfig {
     /// Process-global clubhouse presence (seats, walkers, emotes). `None`
     /// on headless/test paths, which keeps the room session-local.
     pub clubhouse_lobby: Option<crate::app::clubhouse::lobby::SharedLobby>,
+    /// Process-global Nightcap seats. `None` on headless/test paths, same
+    /// as `clubhouse_lobby`.
+    pub nightcap_lobby: Option<crate::app::clubhouse::nightcap::lobby::SharedSeats>,
+    pub nightcap_house: Option<crate::app::clubhouse::nightcap::svc::NightcapHouse>,
     /// Process-global ghost-bot mention cooldown ladders, peeked at composer
     /// submit for the cooldown banner. Tests pass a fresh instance.
     pub mention_ladders: crate::app::ai::ladder::MentionLadders,
@@ -400,9 +411,6 @@ pub struct SessionConfig {
     /// Live 24h username effects, shared process-wide (snapshot-swap; see
     /// `common/username_effect.rs`).
     pub flair_directory: Option<crate::app::common::username_effect::NameFlairDirectory>,
-    /// Live `/status` presence, shared process-wide (snapshot-swap; see
-    /// `common/status.rs`).
-    pub status_directory: Option<StatusDirectory>,
     /// The crown, `/crown` and `/crown take`. `None` in test harnesses that
     /// build an app without one; the glyph then simply never appears.
     pub crown_service: Option<crate::app::crown::svc::CrownService>,
@@ -470,6 +478,9 @@ pub struct App {
     /// None = never fired (fire immediately so first frames have presence,
     /// directory, and clock state).
     pub(crate) last_one_hz_index: Option<usize>,
+    /// Where the attention metric last counted up to; the 1Hz edge adds
+    /// the seconds since then to the screen in front of the user.
+    pub(crate) attention_mark: Instant,
     pub(crate) splash_hint: String,
     pub(crate) show_quit_confirm: bool,
     pub(crate) show_help: bool,
@@ -488,6 +499,9 @@ pub struct App {
     pub(crate) ultimate_cooldown_was_running: bool,
     /// The Late Edition: its modal, the login pop, and the `/paper` drain.
     pub(crate) paper: crate::app::paper::state::PaperState,
+    /// The Jobs shelf: the replica's active postings, the selection, and
+    /// the `/jobs` drain.
+    pub(crate) jobs: crate::app::jobs::state::JobsState,
     pub(crate) help_modal_state: help_modal::state::HelpModalState,
     pub(crate) leaderboard_page: crate::app::leaderboard::state::LeaderboardPageState,
     pub(crate) aquarium_state: hub::aquarium::state::AquariumState,
@@ -533,6 +547,12 @@ pub struct App {
     >,
     /// Admin-gated clubhouse tavern (page `0`): avatar, crowd, animations.
     pub(crate) clubhouse: crate::app::clubhouse::state::State,
+    /// Nightcap: the small bar reachable with `n` from the clubhouse.
+    pub(crate) nightcap: crate::app::clubhouse::nightcap::state::State,
+    pub(crate) nightcap_house: Option<crate::app::clubhouse::nightcap::svc::NightcapHouse>,
+    /// The night city page (`app/deadchannel/city`): where the runner
+    /// stands, the open shop panel, the street's last line.
+    pub(crate) city: crate::app::deadchannel::city::state::State,
     /// Chips backend, kept for the clubhouse's on-the-house welcome pour.
     pub(crate) chip_service: crate::app::games::chips::svc::ChipService,
     /// Staff bot ids from the active-users map, for speech bubbles and the
@@ -553,16 +573,15 @@ pub struct App {
     pub(crate) runner_looks: crate::app::deadchannel::runner::svc::RunnerLooks,
     pub(crate) runner_looks_rx:
         tokio::sync::watch::Receiver<crate::app::deadchannel::runner::svc::RunnerLooks>,
-    /// Per-peer `/status` badges, rebuilt from the status directory on the
-    /// same ~1s cadence; chat author labels read this owned map, never the
-    /// directory mutex.
-    pub(crate) peer_statuses: HashMap<Uuid, String>,
-    /// Human headcount and connected-friend names, recomputed on the same
-    /// ~1s cadence; renderers read these owned values instead of locking the
-    /// shared `active_users` map every frame.
+    /// Every away user (`common/away.rs`), resolved from the active-users
+    /// roster on the ~1s presence edge; chat author labels, the DM list, and
+    /// @-completion read this owned set, never the roster mutex.
+    pub(crate) away_user_ids: HashSet<Uuid>,
+    /// Human headcount and connected friends, recomputed on the same ~1s
+    /// cadence; renderers read these owned values instead of locking the
+    /// shared `active_users` map every frame. The friends feed the sidebar
+    /// friends row and the Zen Friends tile.
     pub(crate) online_count: usize,
-    pub(crate) active_friend_names: Vec<String>,
-    /// The same friends with what the Zen Friends tile shows beside them.
     pub(crate) active_friends: Vec<crate::app::chat::state::ActiveFriend>,
     /// The unread mention count the mentions list was last requested at
     /// while an Inbox tile is on the Zen page (the list loads only on ask).
@@ -579,7 +598,6 @@ pub struct App {
     /// every real change).
     pub(super) last_username_directory: Option<Arc<HashMap<Uuid, String>>>,
     pub(super) flair_directory: Option<crate::app::common::username_effect::NameFlairDirectory>,
-    pub(super) status_directory: Option<StatusDirectory>,
     pub(super) crown_service: Option<crate::app::crown::svc::CrownService>,
     /// The process-shared crown holder, read on the ~1s edge and folded into
     /// `name_flair`, so no render ever queries for the glyph.
@@ -663,9 +681,11 @@ pub struct App {
     pub(crate) poll_modal_state: chat::polls::state::PollModalState,
     pub(crate) gild_modal_state: chat::gild::state::GildModalState,
     pub(crate) room_search_modal_state: crate::app::room_search_modal::state::RoomSearchModalState,
-    /// The `/status` picker overlay.
-    pub(crate) status_picker: crate::app::status_picker::state::StatusPickerState,
     pub(crate) room_info_modal_state: crate::app::room_info_modal::state::RoomInfoModalState,
+    /// The profile editor opened from page 5 (`app/directory/editor`).
+    pub(crate) directory_editor: crate::app::directory::editor::state::EditorState,
+    /// The tag picker the settings modal and the profile editor open.
+    pub(crate) tag_picker: super::tag_picker::state::TagPickerState,
     pub(crate) booth_modal_state: crate::app::audio::booth::state::BoothModalState,
     /// Server-authoritative audio source for the paired playback surface.
     /// Mirrors `users.settings.audio_source`. v+x flips this, persists it to
@@ -706,6 +726,15 @@ pub struct App {
 
     /// Bonsai
     pub(crate) bonsai: crate::app::bonsai::session::BonsaiSession,
+    /// The runner's fight (`app/deadchannel/fight`): the sheet mirror and
+    /// the scene over the street. Loaded on the descent into the city.
+    pub(crate) fight: crate::app::deadchannel::fight::session::FightSession,
+    /// The tailor's mirror (`app/deadchannel/tailor`): the draft while
+    /// the panel is open, and the write that puts it on the row.
+    pub(crate) tailor: crate::app::deadchannel::tailor::session::TailorSession,
+    /// The undercity guide (`app/deadchannel/guide`): the box over the
+    /// street, opened by `?` and by itself on the first descent.
+    pub(crate) guide: crate::app::deadchannel::guide::session::GuideSession,
 
     /// Cat companion
     pub(crate) pet_state: crate::app::pet::state::PetState,
@@ -877,7 +906,7 @@ pub struct App {
     pub(crate) dartboard_provenance: crate::app::artboard::provenance::SharedArtboardProvenance,
     pub(crate) artboard_snapshot_service: crate::app::artboard::svc::ArtboardSnapshotService,
     pub(crate) gallery_service: crate::app::artboard::gallery::svc::GalleryService,
-    /// The podium piece over this session's splash, claimed once at
+    /// The wall piece over this session's splash, claimed once at
     /// bootstrap; `None` draws the coffee cup.
     pub(crate) splash_piece: Option<crate::app::artboard::gallery::svc::SplashPiece>,
     pub(crate) username: String,
@@ -891,18 +920,26 @@ pub struct App {
     /// Terminal control sequences that should be emitted after the frame diff.
     pub(crate) pending_terminal_commands: Vec<Vec<u8>>,
 
-    pub(crate) terminal_image_protocol: Option<TerminalImageProtocol>,
+    /// What the terminal reported (TERM, env hints, XTVERSION, DA1). Read
+    /// through [`App::terminal_image_protocol`], which applies the user's
+    /// Terminal images tweak on top.
+    pub(crate) detected_image_protocol: Option<TerminalImageProtocol>,
     pub(crate) terminal_images_disabled: bool,
     pub(crate) inline_image_symbol_mode: InlineImageSymbolMode,
     pub(crate) terminal_image_render_state: TerminalImageRenderState,
 
     /// Desktop-notification domain: producers (chat, daily, this session's
-    /// own tick-driven events like a status countdown finishing) push through cloned
-    /// `notifier` handles; render drains `notify_outbox` into OSC bytes.
+    /// own tick-driven events) push through cloned `notifier` handles; render
+    /// drains `notify_outbox` into OSC bytes.
     pub(crate) notifier: crate::app::notify::Notifier,
     pub(crate) notify_outbox: crate::app::notify::Outbox,
-    /// This session's `/status`, if any. `None` when nothing is set.
-    pub(crate) status: Option<SessionStatus>,
+    /// `/brb`: this session was sent away by hand, ahead of the idle
+    /// threshold. Cleared by the next key, click or scroll, never by a bare
+    /// mouse move (`input.rs`, `handle_parsed_input_inner`).
+    pub(crate) sent_away: bool,
+    /// This session's away flag as last written to the active-users roster,
+    /// so the 1Hz edge writes only on a change (`App::sync_away`).
+    pub(crate) away: bool,
 
     /// Last background color sent to the terminal via OSC 11 (if any).
     pub(crate) last_terminal_bg: Option<ratatui::style::Color>,
@@ -937,45 +974,39 @@ pub(super) fn listen_url(web_url: &str) -> String {
 }
 
 impl App {
+    /// A runner: this session's user has a `deadchannel_runners` row, the
+    /// one thing `/join #deadchannel` creates and nothing else does. The
+    /// gate for everything under the clubhouse (the undercity today). Read
+    /// from the owned looks map, so it costs nothing on the hot path and
+    /// follows a join on the next tick edge, on every replica.
+    pub fn is_runner(&self) -> bool {
+        self.runner_looks.contains_key(&self.user_id)
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
     }
 
-    /// Publish this session's status to the active-users roster and then to
-    /// the process-shared directory, so peers' chat author labels can paint
-    /// it. The roster goes first because the directory entry is rebuilt from
-    /// every session the user has open. The single write path:
-    /// every place that changes `status` goes through it, which is also how a
-    /// clear and an expiry retire the peer badge.
-    pub(crate) fn publish_status(&self) {
-        self.set_shared_session_status();
-        let Some(directory) = &self.status_directory else {
-            return;
-        };
-        match &self.active_users {
-            Some(active_users) => crate::app::common::status::publish_for_user(
-                directory,
+    /// Recompute this session's away flag (`common/away.rs`) and write it to
+    /// the active-users roster when it changed. Rides the 1Hz presence edge,
+    /// so peers see a session go away or come back within a second of it.
+    /// Returns whether the flag moved.
+    pub(crate) fn sync_away(&mut self) -> bool {
+        let away =
+            crate::app::common::away::session_is_away(self.last_input_at.elapsed(), self.sent_away);
+        if away == self.away {
+            return false;
+        }
+        self.away = away;
+        if let Some(active_users) = &self.active_users {
+            crate::app::common::away::set_session_away(
                 active_users,
                 self.user_id,
-                self.status,
-            ),
-            None => crate::app::common::status::set_user(directory, self.user_id, self.status),
+                &self.session_token,
+                away,
+            );
         }
-    }
-
-    /// Set this session's status and publish it. `None` clears.
-    pub(crate) fn set_status(&mut self, status: Option<SessionStatus>) {
-        self.status = status;
-        self.publish_status();
-    }
-
-    /// Clear an open-ended status because the owner posted. A countdown is
-    /// left alone: carrying one is exactly what buys the right to keep
-    /// chatting without losing it.
-    pub(crate) fn clear_status_on_post(&mut self) {
-        if self.status.is_some_and(SessionStatus::clears_on_post) {
-            self.set_status(None);
-        }
+        true
     }
 
     /// The rail modes this session renders from: this device's stored layout if
@@ -1050,6 +1081,8 @@ impl App {
             Screen::Dashboard => self.chat.selected_room_id,
             // The clubhouse pins the embedded chat to #lounge.
             Screen::Clubhouse => self.chat.lounge_room_id(),
+            // The bar out back reads and writes its own hidden room.
+            Screen::Nightcap => self.chat.nightcap_room_id(),
             // The daily board's match chat; None while spectating or before
             // the row loads.
             Screen::DailyMatch => self.daily.board_chat_room_id(),
@@ -1105,7 +1138,7 @@ impl App {
         let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
             .context("failed to create terminal backend")?;
         let terminal_images_disabled = term_disables_terminal_images(&config.term);
-        let terminal_image_protocol = if terminal_images_disabled {
+        let detected_image_protocol = if terminal_images_disabled {
             None
         } else {
             protocol_from_term(&config.term)
@@ -1257,6 +1290,28 @@ impl App {
             config.bonsai_service.clone(),
             bonsai_tree,
         );
+        let mut fight = crate::app::deadchannel::fight::session::FightSession::new(
+            config.user_id,
+            config.username.clone(),
+            config.fight_service.clone(),
+        );
+        // A standing runner's sheet is on the frame HUD from the first
+        // frame, not from the first descent; the read also rolls the day.
+        if config
+            .runner_looks_rx
+            .borrow()
+            .contains_key(&config.user_id)
+        {
+            fight.reload();
+        }
+        let tailor = crate::app::deadchannel::tailor::session::TailorSession::new(
+            config.user_id,
+            config.tailor_service.clone(),
+        );
+        let guide = crate::app::deadchannel::guide::session::GuideSession::new(
+            config.user_id,
+            config.guide_service.clone(),
+        );
 
         let pet_state = if let Some(companion) = config.initial_pet {
             crate::app::pet::state::PetState::new(
@@ -1379,6 +1434,7 @@ impl App {
             started_at: Instant::now(),
             last_input_at: Instant::now(),
             last_one_hz_index: None,
+            attention_mark: Instant::now(),
             splash_hint,
             show_quit_confirm: false,
             show_help: false,
@@ -1398,6 +1454,7 @@ impl App {
                 config.paper_service,
                 config.paper_at_login,
             ),
+            jobs: crate::app::jobs::state::JobsState::new(config.jobs_service),
             help_modal_state: help_modal::state::HelpModalState::new(),
             leaderboard_page: crate::app::leaderboard::state::LeaderboardPageState::new(),
             aquarium_state,
@@ -1433,6 +1490,17 @@ impl App {
                 config.username.clone(),
                 !config.clubhouse_tutorial_done,
             ),
+            nightcap: crate::app::clubhouse::nightcap::state::State::new(
+                config.nightcap_lobby.clone(),
+                config.nightcap_house.as_ref().map(|house| house.wall()),
+                config.user_id,
+                config.username.clone(),
+            ),
+            nightcap_house: config.nightcap_house,
+            city: crate::app::deadchannel::city::state::State::new(),
+            fight,
+            tailor,
+            guide,
             chip_service: config.chip_service,
             clubhouse_bartender_id: None,
             clubhouse_graybeard_id: None,
@@ -1441,19 +1509,17 @@ impl App {
             name_flair: HashMap::new(),
             runner_looks: config.runner_looks_rx.borrow().clone(),
             runner_looks_rx: config.runner_looks_rx.clone(),
-            peer_statuses: HashMap::new(),
+            away_user_ids: HashSet::new(),
             online_count: active_users
                 .as_ref()
-                .map(crate::state::online_human_count)
+                .map(|users| crate::state::online_human_count(&users.lock_recover()))
                 .unwrap_or(0),
-            active_friend_names: Vec::new(),
             active_friends: Vec::new(),
             zen_inbox_listed_unread: None,
             last_sidebar_clock: String::new(),
             chat_ctx_epoch: 0,
             last_username_directory: None,
             flair_directory: config.flair_directory,
-            status_directory: config.status_directory,
             crown_holder_rx: config
                 .crown_service
                 .as_ref()
@@ -1540,9 +1606,10 @@ impl App {
             gild_modal_state: chat::gild::state::GildModalState::new(),
             room_search_modal_state:
                 crate::app::room_search_modal::state::RoomSearchModalState::default(),
-            status_picker: crate::app::status_picker::state::StatusPickerState::default(),
             room_info_modal_state: crate::app::room_info_modal::state::RoomInfoModalState::default(
             ),
+            directory_editor: crate::app::directory::editor::state::EditorState::default(),
+            tag_picker: super::tag_picker::state::TagPickerState::default(),
             booth_modal_state: crate::app::audio::booth::state::BoothModalState::default(),
             paired_source: config.initial_audio_source,
             selected_icecast_stream: config.initial_icecast_stream,
@@ -1559,7 +1626,6 @@ impl App {
             key_fingerprint: config.key_fingerprint,
             profile_modal_state: profile_modal::state::ProfileModalState::new(
                 config.profile_service.clone(),
-                config.showcase_service.clone(),
             ),
             settings_modal_state,
             sheet_modal_state: sheet_modal::state::SheetModalState::new(),
@@ -1685,13 +1751,14 @@ impl App {
             chip_balance: config.initial_chip_balance,
             pending_clipboard: None,
             pending_terminal_commands,
-            terminal_image_protocol,
+            detected_image_protocol,
             terminal_images_disabled,
             inline_image_symbol_mode,
             terminal_image_render_state: TerminalImageRenderState::default(),
             notifier,
             notify_outbox,
-            status: None,
+            sent_away: false,
+            away: false,
             is_draining: config.is_draining,
             icon_picker_open: false,
             icon_picker_state: super::icon_picker::IconPickerState::default(),
@@ -2267,6 +2334,16 @@ impl App {
             self.house.close();
         }
 
+        // A Nightcap stool is held only while its owner is in the room.
+        // There are six of them and sitting is the room's one verb, so a
+        // seat kept across a screen change is a claim that outlives the
+        // visit: six such claims close the bar for the rest of those
+        // sessions. `SharedSeats::sync` cannot clean this up, since it only
+        // evicts users who left `active_users`, which means disconnected.
+        if self.screen == Screen::Nightcap && screen != Screen::Nightcap {
+            self.nightcap.leave_screen();
+        }
+
         if self.screen == Screen::Scratchpad && screen != Screen::Scratchpad {
             // Dropping `scratchpad` here (rather than an explicit
             // `leave_scratchpad` method) runs `ScratchpadState`'s `Drop`
@@ -2393,7 +2470,7 @@ impl App {
             return;
         }
         if let Some(protocol) = protocol_from_env_hint(name, value) {
-            self.terminal_image_protocol = Some(protocol);
+            self.detected_image_protocol = Some(protocol);
         }
     }
 
@@ -2409,7 +2486,7 @@ impl App {
             return;
         }
         if let Some(protocol) = protocol_from_xtversion(value) {
-            self.terminal_image_protocol = Some(protocol);
+            self.detected_image_protocol = Some(protocol);
         }
     }
 
@@ -2424,14 +2501,25 @@ impl App {
             return;
         }
         if let Some(protocol) = protocol_from_terminal_features(value) {
-            self.terminal_image_protocol = Some(protocol);
+            self.detected_image_protocol = Some(protocol);
+        }
+    }
+
+    /// The protocol inline images are drawn with: the detected one, unless
+    /// the user's Terminal images tweak overrides it. Read live, so flipping
+    /// the tweak takes effect on the next frame.
+    pub(crate) fn terminal_image_protocol(&self) -> Option<TerminalImageProtocol> {
+        match self.profile_state.profile().terminal_images {
+            TerminalImagesMode::Auto => self.detected_image_protocol,
+            TerminalImagesMode::Off => None,
+            TerminalImagesMode::Sixel => Some(TerminalImageProtocol::Sixel),
         }
     }
 
     pub(crate) fn apply_primary_device_attributes(&mut self, attrs: &[u16]) {
         tracing::trace!(
             ?attrs,
-            current_protocol = ?self.terminal_image_protocol,
+            current_protocol = ?self.detected_image_protocol,
             images_disabled = self.terminal_images_disabled,
             "terminal DA1 reply"
         );
@@ -2442,11 +2530,11 @@ impl App {
         // advertise sixel here while supporting richer iTerm2 graphics, so
         // never displace a protocol detected from TERM, env hints, XTVERSION,
         // or the iTerm2 capabilities reply.
-        if self.terminal_image_protocol.is_some() {
+        if self.detected_image_protocol.is_some() {
             return;
         }
         if let Some(protocol) = protocol_from_device_attributes(attrs) {
-            self.terminal_image_protocol = Some(protocol);
+            self.detected_image_protocol = Some(protocol);
         }
     }
 
@@ -2700,6 +2788,95 @@ impl App {
         );
     }
 
+    /// Sync Nightcap's seats with the active-users map about once a second
+    /// while the screen is up, same cadence as `tick_clubhouse`. Only drops
+    /// disconnected occupants — unlike the Clubhouse, nobody holds a seat
+    /// until they press a number key, so there is no roster to seat people
+    /// into.
+    /// Returns whether the bar changed on screen and a frame is owed: a
+    /// settled order or carve, another patron's stool, a pour, the TV.
+    pub(crate) fn tick_nightcap(&mut self) -> bool {
+        let mut changed = self.nightcap.tick(self.marquee_tick as u64);
+        // Settled orders land whether or not the screen is up: the chips
+        // moved either way, and the footer should say so on the next visit.
+        changed |= self.nightcap.drain_outcomes();
+        if self.screen != Screen::Nightcap {
+            return false;
+        }
+
+        if self.nightcap.roster_refresh_due() {
+            let mut roster = Vec::new();
+            if let Some(active_users) = &self.active_users {
+                let active_users = active_users.lock_recover();
+                for (user_id, user) in active_users.iter() {
+                    if user.fingerprint.is_none() {
+                        continue; // ghost bots don't hold a seat
+                    }
+                    roster.push((*user_id, user.username.clone()));
+                }
+            }
+            self.nightcap.refresh_roster(&roster);
+        }
+
+        changed |= self.nightcap.refresh_snapshot();
+        changed
+    }
+
+    /// A seated Nightcap patron orders from the house menu. `State::pick`
+    /// gates it (a stool, one order at a time); `nightcap::svc` moves the
+    /// chips off-thread on the same rails as the tavern's bartender and
+    /// reports back over the session's outcome channel.
+    pub(crate) fn nightcap_order(&mut self, order: crate::app::clubhouse::nightcap::state::Order) {
+        let Some(order) = self.nightcap.pick(order) else {
+            return;
+        };
+        let Some(seats) = self.nightcap.seats_handle() else {
+            return;
+        };
+        crate::app::clubhouse::nightcap::svc::spawn_order(
+            self.chip_service.clone(),
+            self.clubhouse.lobby_handle(),
+            seats,
+            self.nightcap_voice(),
+            self.user_id,
+            order,
+            self.nightcap.outcome_sender(),
+        );
+    }
+
+    /// How the Nightcap announces a drink that landed: a `system` line in
+    /// the room, so the other stools see who ordered what. `None` before the
+    /// session's snapshot carries the room, or without a username directory
+    /// to name the drinkers.
+    fn nightcap_voice(&self) -> Option<crate::app::clubhouse::nightcap::svc::HouseVoice> {
+        Some(crate::app::clubhouse::nightcap::svc::HouseVoice::new(
+            self.chat.service.clone(),
+            self.chat.nightcap_room_id()?,
+            self.username_directory.clone()?,
+        ))
+    }
+
+    /// Re-count the drinks this patron has banked from other people's
+    /// rounds, for the menu's `free x2` label. Asked when the menu opens:
+    /// that is the only place the count is printed, and a round bought by
+    /// somebody else can land at any time.
+    pub(crate) fn nightcap_check_credits(&mut self) {
+        crate::app::clubhouse::nightcap::svc::spawn_credit_check(
+            self.chip_service.clone(),
+            self.user_id,
+            self.nightcap.outcome_sender(),
+        );
+    }
+
+    /// A seated Nightcap patron carves a line into their stool. `State::take_carving`
+    /// gated it; the house writes it and updates the shared wall in place.
+    pub(crate) fn nightcap_carve(&mut self, stool: usize, body: String) {
+        let Some(house) = self.nightcap_house.clone() else {
+            return;
+        };
+        house.spawn_carve(self.user_id, stool, body, self.nightcap.outcome_sender());
+    }
+
     /// Persist "the clubhouse tutorial ran" (fire-and-forget).
     pub(crate) fn persist_clubhouse_tutorial_done(&self) {
         self.profile_state
@@ -2854,26 +3031,6 @@ impl App {
                 }
             }
         });
-    }
-
-    /// Mirror this session's status onto the active-users roster. The
-    /// directory's per-user entry is rebuilt from these copies, which is how a
-    /// clear or a disconnect here falls back to another session's status.
-    fn set_shared_session_status(&self) {
-        let Some(active_users) = &self.active_users else {
-            return;
-        };
-        let mut active_users = active_users.lock_recover();
-        let Some(active) = active_users.get_mut(&self.user_id) else {
-            return;
-        };
-        if let Some(session) = active
-            .sessions
-            .iter_mut()
-            .find(|session| session.token == self.session_token)
-        {
-            session.status = self.status;
-        }
     }
 
     pub fn paired_client_volume_up(&mut self) -> bool {
@@ -3623,7 +3780,7 @@ impl App {
         let _ = crossterm::execute!(shared, terminal::Clear(ClearType::All));
         self.terminal.swap_buffers();
         self.terminal.swap_buffers();
-        if self.terminal_image_protocol == Some(TerminalImageProtocol::Kitty) {
+        if self.terminal_image_protocol() == Some(TerminalImageProtocol::Kitty) {
             self.pending_terminal_commands
                 .extend(kitty_cleanup_commands());
         }

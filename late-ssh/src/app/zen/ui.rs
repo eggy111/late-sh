@@ -3,7 +3,6 @@
 //! reef, the pet box, the embedded room chat, the equalizer); what this
 //! file adds is the composition and the chrome.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ratatui::{
@@ -14,7 +13,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use uuid::Uuid;
 
 use super::{
     bigclock,
@@ -44,12 +42,34 @@ use crate::app::{
     pet::ui::{Neighbours, PetPose, PetView, WatchTarget, draw_pet_box},
 };
 
-/// A chat tile's frame: its room's label and its view (`None` when the
-/// account has no room at all). The active tile's view carries the
-/// composer and the selection; the others only watch (`render.rs`).
+/// A chat tile's frame: its room's label, the watcher count badge when the
+/// room has a registered stream (`chat::ui::stream_count_badge`, the same
+/// `[3]` the rail shows), and its view (`None` when the account has no room
+/// at all). The active tile's view carries the composer and the selection;
+/// the others only watch (`render.rs`).
 pub(crate) struct ZenChatTile<'a> {
     pub label: String,
+    pub stream_badge: Option<String>,
     pub view: Option<EmbeddedRoomChatView<'a>>,
+}
+
+/// A chat tile's title: `Chat · #mat-live [3]`. The tile does not draw the
+/// room's stream header, so the badge is the page's only watcher count, and
+/// it must survive a narrow tile: the border clips a title from the right,
+/// which would drop the count first. So the room label is what shortens,
+/// never the badge. `width` is the tile's full width; the corners and the
+/// title's padding spaces take four cells of it.
+pub(crate) fn chat_tile_title(label: &str, stream_badge: Option<&str>, width: u16) -> String {
+    let kind = TileKind::Chat.label();
+    match stream_badge {
+        None => format!("{kind} · {label}"),
+        Some(badge) => {
+            let fixed = UnicodeWidthStr::width(kind) + " · ".width() + 1 + badge.width();
+            let budget = (width as usize).saturating_sub(4 + fixed);
+            let label = crate::app::chat::ui::truncate_cells(label, budget);
+            format!("{kind} · {label} {badge}")
+        }
+    }
 }
 
 /// Everything the Zen page reads, assembled once per frame in `render.rs`.
@@ -82,8 +102,6 @@ pub(crate) struct ZenView<'a> {
     /// The #lounge activity feed, newest first (`ChatState::activity_ticker`).
     pub activity: &'a [ActivityTickerEntry],
     pub active_friends: &'a [ActiveFriend],
-    /// Per-peer `/status` badges, for the Friends tile.
-    pub peer_statuses: &'a HashMap<Uuid, String>,
     /// The viewer's chips and today's care, for the Pulse tile.
     pub chip_balance: i64,
     pub care: Care,
@@ -153,7 +171,9 @@ pub(crate) fn draw_rice(
             | TileKind::Blank => None,
         };
         let title = match (kind, &chat_tile) {
-            (TileKind::Chat, Some(tile)) => format!("{} · {}", kind.label(), tile.label),
+            (TileKind::Chat, Some(tile)) => {
+                chat_tile_title(&tile.label, tile.stream_badge.as_deref(), rect.width)
+            }
             (TileKind::Chat, None) => kind.label().to_string(),
             (
                 TileKind::Bonsai
@@ -231,9 +251,7 @@ pub(crate) fn draw_rice(
             TileKind::Activity => {
                 draw_activity_tile(frame, padded, view.activity, view.active_friends)
             }
-            TileKind::Friends => {
-                draw_friends_tile(frame, padded, view.active_friends, view.peer_statuses)
-            }
+            TileKind::Friends => draw_friends_tile(frame, padded, view.active_friends),
             TileKind::Pulse => draw_pulse_tile(
                 frame,
                 padded,
@@ -884,14 +902,10 @@ fn names_actor(text: &str, username: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(' '))
 }
 
-/// Connected friends, the most recent login first: the name, their
-/// `/status` when set, their audio source, and how long they have been on.
-fn draw_friends_tile(
-    frame: &mut Frame,
-    area: Rect,
-    friends: &[ActiveFriend],
-    peer_statuses: &HashMap<Uuid, String>,
-) {
+/// Connected friends, here before away, then the most recent login: the
+/// name, the away glyph when away, their audio source, and how long they
+/// have been on.
+fn draw_friends_tile(frame: &mut Frame, area: Rect, friends: &[ActiveFriend]) {
     if friends.is_empty() {
         draw_centered_note(frame, area, &["no friends online"]);
         return;
@@ -910,11 +924,11 @@ fn draw_friends_tile(
                     Style::default().fg(theme::TEXT_BRIGHT()),
                 ),
             ];
-            if let Some(badge) = peer_statuses.get(&friend.user_id) {
-                spans.push(Span::styled(
-                    format!("  {badge}"),
-                    Style::default().fg(theme::AMBER()),
-                ));
+            if friend.away {
+                spans.push(Span::raw(format!(
+                    " {}",
+                    crate::app::common::away::AWAY_GLYPH
+                )));
             }
             spans.push(Span::styled(
                 format!("  ♪ {}", audio_source_word(friend.audio_source)),

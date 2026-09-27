@@ -23,6 +23,7 @@ pub(crate) mod icon_picker;
 pub mod input;
 #[cfg(test)]
 mod input_flow_test;
+pub mod jobs;
 pub(crate) mod leaderboard;
 pub mod lobby;
 pub(crate) mod mod_modal;
@@ -46,8 +47,8 @@ mod smoke_test;
 pub mod state;
 #[cfg(test)]
 mod state_test;
-pub(crate) mod status_picker;
 pub mod stream;
+pub(crate) mod tag_picker;
 pub(crate) mod terminal_backend;
 #[cfg(test)]
 mod terminal_backend_test;

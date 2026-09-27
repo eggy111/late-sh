@@ -390,10 +390,8 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
             None
         }
     };
-    // The door: the next of last month's podium pieces this account has
-    // not seen, or the cup. One claim per login, the gallery logs its
-    // own failures.
-    let splash_piece = state.gallery_service.claim_splash_piece(user_id).await;
+    // The door: the day's wall piece, or the cup.
+    let splash_piece = state.gallery_service.splash_piece();
     let initial_door_rcs = match state.door_rc_service.list(user_id).await {
         Ok(rcs) => rcs,
         Err(e) => {
@@ -424,6 +422,7 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         translation_service: state.translation_service.clone(),
         summary_service: state.summary_service.clone(),
         paper_service: state.paper_service.clone(),
+        jobs_service: state.jobs_service.clone(),
         notification_service: state.notification_service.clone(),
         article_service: state.article_service.clone(),
         feed_service: state.feed_service.clone(),
@@ -473,6 +472,12 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         splash_piece,
         username: user.username.clone(),
         bonsai_service: state.bonsai_service.clone(),
+        fight_service: crate::app::deadchannel::fight::svc::FightService::new(
+            state.db.clone(),
+            state.chat_service.clone(),
+        ),
+        tailor_service: crate::app::deadchannel::tailor::svc::TailorService::new(state.db.clone()),
+        guide_service: crate::app::deadchannel::guide::svc::GuideService::new(state.db.clone()),
         initial_bonsai_tree,
         initial_bonsai_decay_protection,
         pet_service: state.pet_service.clone(),
@@ -539,6 +544,8 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         radio_meta_rx: Some(state.radio_meta_rx.clone()),
         active_users: Some(state.active_users.clone()),
         clubhouse_lobby: Some(state.clubhouse_lobby.clone()),
+        nightcap_lobby: Some(state.nightcap_lobby.clone()),
+        nightcap_house: Some(state.nightcap_house.clone()),
         mention_ladders: state.mention_ladders.clone(),
         files: state.config.files.clone(),
         scratchpad_registry: Some(state.scratchpad_registry.clone()),
@@ -555,7 +562,6 @@ pub async fn build_session_config(state: &State, inputs: SessionBootstrapInputs)
         zen_layout: late_core::models::user::extract_zen_layout(&user.settings),
         username_directory: Some(state.username_directory.clone()),
         flair_directory: Some(state.flair_directory.clone()),
-        status_directory: Some(state.status_directory.clone()),
         crown_service: Some(state.crown_service.clone()),
         pot_service: Some(state.pot_service.clone()),
         activity_feed_rx,

@@ -135,6 +135,17 @@ pub enum ActivityKind {
         winner_tickets: i64,
         total_tickets: i64,
     },
+    /// The open pot draws soon: one reminder per pot, claimed in the table
+    /// so one replica posts it. Nobody did anything, so there is no user;
+    /// the ticker line reads "pot draws in 30m ...". `pot_id` keys the
+    /// #lounge repeat throttle.
+    PotClosing {
+        pot_id: Uuid,
+        size: i64,
+        total_tickets: i64,
+        ticket_price: i64,
+        draws_in_secs: i64,
+    },
     /// A linked user published an entry on cyberspace.online from late.sh.
     /// Announces our user's own action, never cyberspace content.
     CyberspacePosted {
@@ -206,6 +217,7 @@ impl ActivityKind {
             | Self::CrownTaken { .. }
             | Self::RoundBought { .. }
             | Self::PotDrawn { .. }
+            | Self::PotClosing { .. }
             | Self::CyberspacePosted { .. }
             | Self::WentLive { .. }
             | Self::WatchingStream { .. } => ActivityCategory::Session,
@@ -260,7 +272,50 @@ pub enum ActivityGame {
     Traffic,
 }
 
+/// Which shelf a game sits on, for splitting its wins on the dashboard.
+/// Lateania is its own family because its `GameWon` is a mob kill, not a
+/// finish: summed with the rest it would drown every other game.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameFamily {
+    /// The Arcade's daily puzzles (daily and personal boards).
+    ArcadeDaily,
+    /// The Arcade's score runs.
+    ArcadeScore,
+    /// Door games whose win is an ending (NetHack, DCSS, Brogue, Green
+    /// Dragon, A Dark Room).
+    Door,
+    /// Lateania: one "win" per mob kill.
+    Lateania,
+    /// House tables in the Lobby.
+    Table,
+    /// Human-vs-human matches.
+    Match,
+}
+
 impl ActivityGame {
+    pub fn family(self) -> GameFamily {
+        match self {
+            Self::LeWord
+            | Self::Minesweeper
+            | Self::Nonogram
+            | Self::RubiksCube
+            | Self::SlidingPuzzle
+            | Self::Solitaire
+            | Self::Sudoku => GameFamily::ArcadeDaily,
+            Self::Lateris | Self::TwentyFortyEight | Self::Snake | Self::Traffic => {
+                GameFamily::ArcadeScore
+            }
+            Self::Nethack | Self::Dcss | Self::Brogue | Self::GreenDragon | Self::Darkroom => {
+                GameFamily::Door
+            }
+            Self::Mud => GameFamily::Lateania,
+            Self::Blackjack | Self::Poker | Self::Asterion | Self::Tron | Self::Ssnake => {
+                GameFamily::Table
+            }
+            Self::Chess | Self::TicTacToe | Self::Sshattrick => GameFamily::Match,
+        }
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             Self::Asterion => "asterion",
@@ -714,6 +769,37 @@ impl ActivityEvent {
                 payout,
                 winner_tickets,
                 total_tickets,
+            },
+            action,
+        )
+    }
+
+    /// The open pot is about to draw. Authored by nobody: the ticker line
+    /// names the pot itself, so it reads "pot draws in 30m: ...".
+    pub fn pot_closing(
+        pot_id: Uuid,
+        size: i64,
+        total_tickets: i64,
+        ticket_price: i64,
+        draws_in_secs: i64,
+    ) -> Self {
+        use crate::app::common::primitives::thousands;
+        use crate::app::pot::state::short_duration;
+        let action = format!(
+            "draws in {}: {} chips on {} tickets",
+            short_duration(draws_in_secs),
+            thousands(size),
+            thousands(total_tickets)
+        );
+        Self::new(
+            None,
+            "pot",
+            ActivityKind::PotClosing {
+                pot_id,
+                size,
+                total_tickets,
+                ticket_price,
+                draws_in_secs,
             },
             action,
         )

@@ -119,6 +119,8 @@ async fn send_pre_translates_to_english_for_opted_in_authors() {
             start_with_music_muted: false,
             landing_page: late_core::models::user::LandingPage::Clubhouse,
             paper_at_login: true,
+            terminal_images: late_core::models::user::TerminalImagesMode::Auto,
+            hidden_award_categories: Vec::new(),
             show_flag_fallback: false,
             translate_to: TranslateLang::En,
             auto_translate: false,
@@ -736,6 +738,8 @@ async fn room_tail_task_loads_favorite_room_history() {
             start_with_music_muted: false,
             landing_page: late_core::models::user::LandingPage::Clubhouse,
             paper_at_login: true,
+            terminal_images: late_core::models::user::TerminalImagesMode::Auto,
+            hidden_award_categories: Vec::new(),
             show_flag_fallback: false,
             translate_to: late_core::models::message_translation::TranslateLang::En,
             auto_translate: false,
@@ -1951,7 +1955,7 @@ async fn mod_server_kick_command_terminates_active_sessions_and_audits() {
                 token: session_token.clone(),
                 fingerprint: Some(target.fingerprint.clone()),
                 peer_ip: Some(peer_ip),
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: std::time::Instant::now(),
@@ -2035,7 +2039,7 @@ async fn mod_server_ban_command_bans_and_terminates_active_sessions() {
                 token: session_token.clone(),
                 fingerprint: Some(target.fingerprint.clone()),
                 peer_ip: Some(peer_ip),
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: std::time::Instant::now(),
@@ -2156,7 +2160,7 @@ async fn mod_artboard_ban_command_notifies_active_sessions() {
                 token: session_token.clone(),
                 fingerprint: Some(target.fingerprint.clone()),
                 peer_ip: None,
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: std::time::Instant::now(),
@@ -2861,7 +2865,7 @@ async fn mod_room_ban_command_notifies_target_sessions_to_drop_room() {
                 token: session_token.clone(),
                 fingerprint: Some(target.fingerprint.clone()),
                 peer_ip: None,
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: std::time::Instant::now(),
@@ -2938,7 +2942,7 @@ async fn mod_slow_command_creates_row_audits_and_notifies_target_session() {
                 token: session_token.clone(),
                 fingerprint: Some(target.fingerprint.clone()),
                 peer_ip: None,
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: std::time::Instant::now(),
@@ -3039,7 +3043,7 @@ async fn mod_server_slow_command_creates_server_row_and_notifies_target_session(
                 token: session_token.clone(),
                 fingerprint: Some(target.fingerprint.clone()),
                 peer_ip: None,
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: std::time::Instant::now(),
@@ -3131,7 +3135,7 @@ async fn grant_mod_command_updates_active_session_permissions() {
                 token: session_token.clone(),
                 fingerprint: Some(target.fingerprint.clone()),
                 peer_ip: None,
-                status: None,
+                away: false,
             }],
             connection_count: 1,
             last_login_at: std::time::Instant::now(),
@@ -3204,7 +3208,7 @@ async fn admin_ultimate_cast_command_broadcasts_to_active_sessions_and_audits() 
                     token: actor_token.clone(),
                     fingerprint: Some(actor.fingerprint.clone()),
                     peer_ip: None,
-                    status: None,
+                    away: false,
                 }],
                 connection_count: 1,
                 last_login_at: std::time::Instant::now(),
@@ -3220,7 +3224,7 @@ async fn admin_ultimate_cast_command_broadcasts_to_active_sessions_and_audits() 
                     token: target_token.clone(),
                     fingerprint: Some(target.fingerprint.clone()),
                     peer_ip: None,
-                    status: None,
+                    away: false,
                 }],
                 connection_count: 1,
                 last_login_at: std::time::Instant::now(),
@@ -4437,6 +4441,53 @@ async fn a_non_stream_game_room_has_no_owner_moderator() {
     );
 }
 
+/// The lobby's `spectate` row opens any live match's board, and the board
+/// draws the match chat for whoever is watching. Membership is the auth for
+/// the tail and for the send, so the join is the whole permission story:
+/// a third party must get into the room and be able to talk in it.
+#[tokio::test]
+async fn a_spectator_joins_a_match_chat_and_talks() {
+    let test_db = new_test_db().await;
+    let service = ChatService::new(
+        test_db.db.clone(),
+        NotificationService::new(test_db.db.clone()),
+    );
+    let client = test_db.db.get().await.expect("db client");
+
+    let challenger = create_test_user(&test_db.db, "match_challenger").await;
+    let opponent = create_test_user(&test_db.db, "match_opponent").await;
+    let spectator = create_test_user(&test_db.db, "match_spectator").await;
+    let room = ChatRoom::create_daily_match_room(
+        &client,
+        "chess",
+        &format!("daily-{}", Uuid::now_v7()),
+        challenger.id,
+        opponent.id,
+    )
+    .await
+    .expect("match room");
+    drop(client);
+
+    service
+        .join_game_room(spectator.id, room.id)
+        .await
+        .expect("spectator join");
+    assert!(
+        is_member(&test_db.db, room.id, spectator.id).await,
+        "a spectator must land in the match room"
+    );
+
+    service.send_message_task(
+        spectator.id,
+        room.id,
+        None,
+        "lovely cut on the seven".to_string(),
+        Uuid::now_v7(),
+        false,
+    );
+    wait_for_message_containing(&test_db.db, room.id, "lovely cut").await;
+}
+
 /// What makes a ban mean anything in a public room: the rail's join path must
 /// refuse a banned user, or they are back in the room the moment they click
 /// it. Enforced down in `ChatRoomMember::join` so every join path inherits it;
@@ -5150,12 +5201,34 @@ async fn deadchannel_join_requires_the_invitation() {
             .expect("find runner")
             .expect("runner created by the invited join");
     crate::app::deadchannel::runner::state::Look::parse(&runner.look).expect("stored look parses");
-    service.open_public_room_task(user.id, "deadchannel".to_string());
-    match timeout(Duration::from_secs(2), events.recv())
+
+    // The voice welcomes the new runner on the wire, by mention, and tells
+    // them the way down and the way out.
+    let welcome = wait_for_message_containing(&test_db.db, room_id, "welcome to the wire").await;
+    assert!(welcome.starts_with("@dc-hopeful."), "{welcome}");
+    assert!(
+        welcome.contains("0 puts you in the clubhouse, 0 again"),
+        "{welcome}"
+    );
+    assert!(welcome.contains("/leave"), "{welcome}");
+    assert!(welcome.contains("/join #deadchannel"), "{welcome}");
+    let voice = service
+        .ensure_first_contact_voice()
         .await
-        .expect("event timeout")
-        .expect("event")
-    {
+        .expect("voice exists after the welcome");
+    let voice_lines = |messages: &[ChatMessage]| {
+        messages
+            .iter()
+            .filter(|message| message.user_id == voice.id)
+            .count()
+    };
+    let messages = ChatMessage::list_recent(&client, room_id, 20)
+        .await
+        .expect("list messages");
+    assert_eq!(voice_lines(&messages), 1);
+
+    service.open_public_room_task(user.id, "deadchannel".to_string());
+    match next_room_event(&mut events).await {
         ChatEvent::RoomJoined { user_id, .. } => assert_eq!(user_id, user.id),
         other => panic!("expected RoomJoined, got {other:?}"),
     }
@@ -5166,6 +5239,62 @@ async fn deadchannel_join_requires_the_invitation() {
             .expect("runner still there");
     assert_eq!(again.id, runner.id);
     assert_eq!(again.look, runner.look);
+
+    // Leaving closes the gate: the runner drops out of the directory every
+    // replica reads, so `App::is_runner` goes false on all of them, and the
+    // portrait goes with it.
+    service.leave_room_task(user.id, room_id, "deadchannel".to_string());
+    match next_room_event(&mut events).await {
+        ChatEvent::RoomLeft { user_id, .. } => assert_eq!(user_id, user.id),
+        other => panic!("expected RoomLeft, got {other:?}"),
+    }
+    assert!(
+        late_core::models::deadchannel_runner::DeadchannelRunner::list_standing(&client)
+            .await
+            .expect("list looks")
+            .is_empty()
+    );
+    // Going dark is news on the wire.
+    wait_for_message_containing(&test_db.db, room_id, "dc-hopeful went dark.").await;
+
+    // The character waits: rejoining gets the same face back, not a new one.
+    service.open_public_room_task(user.id, "deadchannel".to_string());
+    match next_room_event(&mut events).await {
+        ChatEvent::RoomJoined { user_id, .. } => assert_eq!(user_id, user.id),
+        other => panic!("expected RoomJoined, got {other:?}"),
+    }
+    let returned =
+        late_core::models::deadchannel_runner::DeadchannelRunner::find_by_user(&client, user.id)
+            .await
+            .expect("find returned runner")
+            .expect("runner came back");
+    assert_eq!(returned.id, runner.id);
+    assert_eq!(returned.look, runner.look);
+    assert!(returned.left_at.is_none());
+    // And so is coming back.
+    wait_for_message_containing(&test_db.db, room_id, "dc-hopeful is back on the wire.").await;
+
+    // Neither the duplicate join nor the return is a first time: the
+    // welcome was posted once; with the leave and the return the voice has
+    // said exactly three things.
+    let messages = ChatMessage::list_recent(&client, room_id, 20)
+        .await
+        .expect("list messages after the rejoins");
+    assert_eq!(voice_lines(&messages), 3);
+}
+
+/// The next chat event that is not a message landing: the voice's welcome
+/// rides the same broadcast as the room events these tests wait on.
+async fn next_room_event(events: &mut tokio::sync::broadcast::Receiver<ChatEvent>) -> ChatEvent {
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event");
+        if !matches!(event, ChatEvent::MessageCreated { .. }) {
+            return event;
+        }
+    }
 }
 
 #[tokio::test]

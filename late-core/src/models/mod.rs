@@ -83,6 +83,9 @@ pub mod greendragon_commentary;
 pub mod greendragon_news;
 pub mod greendragon_setting;
 pub mod irc_token;
+pub mod job_posting;
+#[cfg(test)]
+mod job_posting_test;
 pub mod le_word;
 #[cfg(test)]
 mod le_word_test;
@@ -115,6 +118,7 @@ mod minesweeper_test;
 pub mod moderation_audit_log;
 pub mod mud_character;
 pub mod mud_world_state;
+pub mod nightcap_carving;
 pub mod nonogram;
 pub mod notification;
 #[cfg(test)]
@@ -167,3 +171,5 @@ pub mod username_effect;
 pub mod voice_channel;
 pub mod work_feed_read;
 pub mod work_profile;
+#[cfg(test)]
+mod work_profile_test;

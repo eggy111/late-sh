@@ -48,9 +48,10 @@ fn bot_context_includes_hub_guide_facts() {
 }
 
 #[test]
-fn sliding_puzzle_guide_documents_the_session_only_image_view() {
+fn sliding_puzzle_guide_documents_the_gallery_art_and_the_session_only_toggle() {
     let arcade = lines_for(HelpTopic::Arcade, false, "").join("\n");
-    assert!(arcade.contains("i toggles numbered and image tiles"));
+    assert!(arcade.contains("the tiles are a gallery piece"));
+    assert!(arcade.contains("i toggles numbered tiles"));
     assert!(arcade.contains("session only"));
     assert!(arcade.contains("same board and rewards"));
 }
@@ -191,7 +192,7 @@ fn bot_context_includes_irc_access_flow() {
 fn chat_guide_lists_user_facing_slash_commands() {
     let lines = chat_help_lines(false).join("\n");
     for expected in [
-        "/brb               shortcut for /status away",
+        "/brb               show as away now",
         "/coffee",
         "/friend [@user]",
         "/friends",
@@ -200,13 +201,16 @@ fn chat_guide_lists_user_facing_slash_commands() {
         "/petname [name]",
         "/poll",
         "/profile [@user]",
-        "/status [word] [m] set your status",
         "/tea",
         "/upload <url>",
     ] {
         assert!(lines.contains(expected), "missing {expected}");
     }
     assert!(!lines.contains("/music"));
+    assert!(
+        !lines.contains("/status"),
+        "away is automatic, there is no /status"
+    );
 }
 
 #[test]

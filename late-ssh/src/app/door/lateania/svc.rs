@@ -47,7 +47,7 @@ use crate::app::{
 };
 use crate::render_signal::RenderSignal;
 
-use super::abilities::{Ability, AbilityEffect, learned_at, unlocked_for};
+use super::abilities::{Ability, AbilityEffect, learned_at, ordered_for, unlocked_for};
 use super::appearance;
 use super::classes::{ARCHETYPE_LEVEL, ArchetypeDef, Class, level_for_xp, xp_for_level};
 use super::crafting::{recipe, recipe_indices_for};
@@ -69,8 +69,8 @@ use super::stats::{
 };
 use super::taming::{PetSkillEffect, beast_species, beasts_at, tame_chance, tame_xp};
 use super::world::{
-    CritterKind, Dir, FeatureKind, MiniMap, MobBehavior, MobSpawn, Perk, RegionProgress,
-    ResourceNode, RoomId, World, craft_stations_at, critter_index, critters_at, features_at,
+    CritterKind, Dir, FeatureKind, MobBehavior, MobSpawn, Perk, RegionProgress, ResourceNode,
+    RoomId, World, craft_stations_at, critter_index, critters_at, features_at,
     frontier_entrance_room, is_frontier_room, node_index, nodes_at, seed_world,
     tutorial_start_room,
 };
@@ -567,16 +567,67 @@ pub struct SkillView {
     pub xp_next: i64,
 }
 
+/// One ingredient line of a recipe, with how many the player is actually
+/// holding. The craft screen tells a maker *which* material they are short of;
+/// a single "need materials" string cannot, and sends them back to the shops
+/// guessing.
+#[derive(Clone, Debug)]
+pub struct CraftIngredientView {
+    pub name: String,
+    /// How many the recipe consumes.
+    pub need: u32,
+    /// How many are in the pack right now.
+    pub have: u32,
+}
+
 /// One recipe row in the crafting panel.
+///
+/// Carries what the output *is*, not just its name: a craft is a gear decision
+/// like a purchase is, so the screen stands the piece it would make against
+/// what is worn in its slot with the same `ItemDetail` the shop and the pack
+/// use (`stats`/`compare`/`compare_pct`/`worn_*`).
 #[derive(Clone, Debug)]
 pub struct CraftEntryView {
     /// Global recipe index, passed back to `craft`.
     pub recipe: usize,
+    /// The item id this recipe produces, for power-ordering the list.
+    pub item_id: u32,
     pub name: String,
+    pub rarity: String,
+    /// How many the craft yields; 1 for almost everything.
+    pub qty: u32,
     /// The craft skill it trains, e.g. "Smithing".
     pub skill: String,
+    /// The player's level in that skill, and the level the recipe wants.
+    pub skill_level: i32,
+    pub level_req: i32,
+    /// Craft xp the recipe grants.
+    pub xp: i32,
     /// Compact ingredient list, e.g. "3x Copper Ingot, 1x Oak Plank".
     pub inputs: String,
+    /// The same list itemised, with what is held against what is needed.
+    pub ingredients: Vec<CraftIngredientView>,
+    /// Compact stat summary of the output, e.g. "+16 atk".
+    pub stats: String,
+    /// How the output compares to what's worn in its slot (see `InvView::compare`).
+    pub compare: String,
+    /// The same comparison as a percent power change (see `InvView::compare_pct`).
+    pub compare_pct: Option<i32>,
+    /// The slot the output goes in, or None for consumables and materials.
+    pub slot: Option<String>,
+    /// What is worn in that slot right now, for the side-by-side.
+    pub worn_name: Option<String>,
+    pub worn_stats: Option<String>,
+    /// The output's flavor text.
+    pub desc: &'static str,
+    /// The collapsible category the output would sit in, for the detail pane.
+    pub category: &'static str,
+    /// How many of the output are already in the pack, for the goods a maker
+    /// keeps a stock of (draughts, oils, poisons, food). None for gear, which
+    /// is weighed against what is worn instead, and for crafted materials
+    /// (ingots, planks, leather), whose count shows where they are spent, on
+    /// the ingredient lines.
+    pub held: Option<u32>,
     /// True when it can be made right now (station here, skilled enough, have
     /// the materials).
     pub craftable: bool,
@@ -772,6 +823,8 @@ pub struct AbilityView {
     pub name: String,
     pub cost: i32,
     pub ready: bool,
+    /// What it does, school included where the school is real
+    /// (`Ability::effect_label`): "fire damage over time", "shield".
     pub effect: String,
 }
 
@@ -1036,6 +1089,15 @@ pub struct MudSnapshot {
     pub reset_versions: HashMap<Uuid, u64>,
 }
 
+/// A live weapon coat, for the effects line and the action-bar chip.
+#[derive(Clone, Debug)]
+pub struct CoatView {
+    /// The coat's school, lowercase ("fire", "poison").
+    pub school: String,
+    /// Strikes left before the coating is spent.
+    pub charges: u8,
+}
+
 #[derive(Clone, Debug)]
 pub struct PlayerView {
     pub joined: bool,
@@ -1098,8 +1160,11 @@ pub struct PlayerView {
     pub nearby_players: Vec<RoomId>,
     /// The live-map RPG view preference, persisted with the character.
     pub rpg_mode: bool,
-    /// Whether a personal waypoint is set (see `set_waypoint`/`warp_to_waypoint`).
-    pub waypoint_set: bool,
+    /// The zone a personal waypoint is fixed in, if one is set (see
+    /// `set_waypoint`/`warp_to_waypoint`). Carries the place name rather than a
+    /// bare flag so the standing-key rail can say where `/` lands without
+    /// spending a room-panel line on it.
+    pub waypoint: Option<String>,
     pub occupants: Vec<OccupantView>,
     /// The companion this player is auto-following, if any (for the UI tag).
     pub following: Option<Uuid>,
@@ -1116,8 +1181,10 @@ pub struct PlayerView {
     pub empower: i32,
     /// True while the player is stunned (skipping their actions).
     pub stunned: bool,
-    /// The active weapon coat as a display line ("fire coat x8"), if any.
-    pub coat: Option<String>,
+    /// The active weapon coat, if any. Kept as parts rather than a rendered
+    /// line so the effects row and the action-bar chip can each spend the
+    /// width they have without either one re-deriving the other's string.
+    pub coat: Option<CoatView>,
     pub abilities: Vec<AbilityView>,
     pub inventory: Vec<InvView>,
     pub shop: Option<ShopView>,
@@ -1173,8 +1240,6 @@ pub struct PlayerView {
     pub resurrection_cap: u8,
     /// Lookable things in the current room (Examine panel).
     pub features: Vec<FeatureView>,
-    /// Overhead map of the explored neighbourhood around the player.
-    pub minimap: MiniMap,
     /// The whole-world atlas: exploration progress per major region (Map panel).
     pub atlas: Vec<RegionProgress>,
     /// The world clock phase, e.g. "dawn"/"day"/"dusk"/"night".
@@ -1243,7 +1308,7 @@ impl PlayerView {
             nearby_foes: Vec::new(),
             nearby_players: Vec::new(),
             rpg_mode: true,
-            waypoint_set: false,
+            waypoint: None,
             occupants: Vec::new(),
             following: None,
             wildlife: Vec::new(),
@@ -1283,7 +1348,6 @@ impl PlayerView {
             resurrections_left: 0,
             resurrection_cap: 0,
             features: Vec::new(),
-            minimap: MiniMap::default(),
             atlas: Vec::new(),
             time_of_day: "day",
             time_of_day_glyph: "\u{25CB}",
@@ -2191,6 +2255,16 @@ impl LateaniaService {
         self.mutate(user_id, move |s| s.use_ability(user_id, slot));
     }
 
+    /// Swap two abilities on the player's action bar (1-based slots).
+    pub fn swap_ability_task(&self, user_id: Uuid, source: u8, target: u8) {
+        self.mutate(user_id, move |s| s.swap_abilities(user_id, source, target));
+    }
+
+    /// Drop the player's custom ability-bar order (back to the natural order).
+    pub fn reset_ability_order_task(&self, user_id: Uuid) {
+        self.mutate(user_id, move |s| s.reset_ability_order(user_id));
+    }
+
     pub fn flee_task(&self, user_id: Uuid) {
         self.mutate(user_id, move |s| s.flee(user_id));
     }
@@ -2213,6 +2287,10 @@ impl LateaniaService {
 
     pub fn quaff_task(&self, user_id: Uuid) {
         self.mutate(user_id, move |s| s.quaff_best(user_id));
+    }
+
+    pub fn coat_task(&self, user_id: Uuid) {
+        self.mutate(user_id, move |s| s.coat_best(user_id));
     }
 
     pub fn toggle_rpg_mode_task(&self, user_id: Uuid) {
@@ -2559,8 +2637,6 @@ struct PlayerState {
     gold: i64,
     banked_gold: i64,
     room: RoomId,
-    /// Previous room entered from, for the highlighted minimap trail.
-    previous_room: Option<RoomId>,
     /// A personal waypoint the player has marked (see `set_waypoint`), warped
     /// to with `warp_to_waypoint` - the far run back from the Frontier's deep
     /// levels to Embergate (and back again) for healing/resurrecting is a real
@@ -2628,6 +2704,10 @@ struct PlayerState {
     /// Kills counted toward the current starter stage, when it is a slay
     /// stage. Persisted alongside.
     starter_kills: u32,
+    /// The player's ability-bar order as ability ids, resolved through
+    /// `abilities::ordered_for`. Empty means the natural unlock order.
+    /// Persisted across sessions (schema v21).
+    ability_order: Vec<u32>,
     /// The chosen archetype path (from `ARCHETYPES`), once level 10 is reached.
     archetype: Option<&'static ArchetypeDef>,
     /// The combat companion at the player's heel, bought or tamed; travels
@@ -2670,6 +2750,10 @@ struct PlayerState {
     /// leaves a DoT of the coat's school (through the foe's resist/weak
     /// profile) and spends one charge. Transient.
     weapon_coat: Option<(DamageType, i32, u8)>,
+    /// The last coat item this player applied, so the one-keystroke `coat_best`
+    /// can break a tie in favour of what they chose themselves rather than
+    /// silently switching schools on them. Transient, like the coat itself.
+    last_coat: Option<u32>,
     /// The friendly NPC the player is currently escorting, if any (transient).
     escort: Option<EscortState>,
     /// Transient warning gate for the start-room Frontier entrance.
@@ -3810,26 +3894,31 @@ pub(super) const TIER_ATTACK_BAR: [i32; 6] = [12, 31, 52, 77, 106, 148];
 /// measured at (mirrors `crafting::LEVEL_REQ`).
 #[cfg(test)]
 pub(super) const TIER_GATE_LEVEL: [i32; 6] = [1, 8, 16, 26, 38, 55];
-/// Poison damage per tick applied by a coated weapon, by poison tier (0..6).
-/// The burst half of the coat family: about 30% of the auto bar but only
-/// `POISON_CHARGES` strikes of it, so a vial is roughly three quarters of an
-/// oil's damage packed into half the window. Cheap, and the right answer when
-/// the fight will be over quickly.
-pub(super) const POISON_PER_TICK: [i32; 6] = [3, 9, 15, 23, 32, 45];
-/// Strikes a single weapon-coating lasts before the poison is spent.
-pub(super) const POISON_CHARGES: u8 = 5;
-/// Ticks each coated strike (poison or oil) festers in the foe. A coat re-seeds
-/// every landed strike and refreshes rather than stacks (see `DotSource`), so
-/// this is the wound's lifetime after the last swing, not a multiplier on it.
-pub(super) const POISON_DOT_TICKS: u8 = 3;
-/// Oil damage per tick, by oil tier (0..6). The sustain half: about a fifth of
-/// the auto bar, held for `OIL_CHARGES` strikes, which is the whole of a boss
-/// fight. Sized so a coated character gains roughly 15% of total output, the
-/// figure the world pass's routed budget is written against.
-pub(super) const OIL_PER_TICK: [i32; 6] = [2, 6, 10, 15, 21, 30];
-/// Strikes a single oil coating lasts. Several fights' worth, so choosing an
-/// oil is a route decision made at the zone gate, not per-fight busywork.
-pub(super) const OIL_CHARGES: u8 = 12;
+/// Coat damage per tick, by tier (0..6) - one curve for every coat in the
+/// game, poison vials and the four alchemy oils alike. About a fifth of the
+/// auto bar, held for `COAT_CHARGES` strikes.
+///
+/// The two used to be separate curves: the poison burst at ~30% of the bar for
+/// five strikes, the oil sustain at ~20% for twelve. That split was never
+/// designed - the vial shipped with crafting and the oils arrived with the
+/// world resist/weak pass, so poison was simply the older item's constants
+/// kept. All that separated them in the end was which school they carried, and
+/// a school is a real difference already. One curve, one charge count, one
+/// price; what a coat *is* is now its school and nothing else.
+pub(super) const COAT_PER_TICK: [i32; 6] = [2, 6, 10, 15, 21, 30];
+/// Strikes a single coating lasts. Sized so applying one is a decision made at
+/// a zone gate and then forgotten - a whole run of trash or three boss pulls -
+/// rather than per-fight busywork with the inventory panel.
+pub(super) const COAT_CHARGES: u8 = 40;
+/// Ticks each coated strike festers in the foe. A coat re-seeds every landed
+/// strike and refreshes rather than stacks (see `DotSource`), so this is the
+/// wound's lifetime after the last swing, not a multiplier on it.
+pub(super) const COAT_DOT_TICKS: u8 = 3;
+/// Charges at or below which `coat_best` will re-coat a weapon that already
+/// carries the school it picked. Above it the key refuses and spends nothing,
+/// because overwriting a healthy coat throws its remaining strikes away; below
+/// it, topping up before a fight is the reasonable thing to want.
+pub(super) const COAT_TOPUP_AT: u8 = COAT_CHARGES / 4;
 /// Share of a character's output that comes from the Physical auto-attack at
 /// band gear; the rest is abilities in the class's school mix. The routed
 /// grind-rate budget in `world_test.rs` splits output this way, and the coat
@@ -3838,7 +3927,7 @@ pub(super) const OIL_CHARGES: u8 = 12;
 #[cfg(test)]
 pub(super) const AUTO_SHARE: f64 = 0.75;
 /// Ticks a cooked meal's well-fed regen lasts.
-const WELL_FED_TICKS: u8 = 8;
+pub(super) const WELL_FED_TICKS: u8 = 8;
 
 /// Percent of the caster's spell power an ability adds to its table
 /// magnitude, by effect. Instant hits get the most, a finisher more still,
@@ -3967,7 +4056,6 @@ impl WorldState {
             gold: STARTING_GOLD,
             banked_gold: 0,
             room: start,
-            previous_room: None,
             waypoint: None,
             visited: Arc::new(HashSet::from([start])),
             target: None,
@@ -3997,6 +4085,7 @@ impl WorldState {
             quest_cooldowns: Vec::new(),
             starter_stage: 0,
             starter_kills: 0,
+            ability_order: Vec::new(),
             archetype: None,
             pet: None,
             kennel: Kennel::default(),
@@ -4010,6 +4099,7 @@ impl WorldState {
             rpg_mode: true,
             last_broadcast: None,
             weapon_coat: None,
+            last_coat: None,
             escort: None,
             frontier_descent_pending: false,
             resurrection_cap: 0,
@@ -4243,7 +4333,6 @@ impl WorldState {
             p.resource_regen = stats.resource_regen;
             p.base_attack = stats.attack;
             p.room = room;
-            p.previous_room = None;
             // A stale waypoint (a room that no longer exists) is simply dropped.
             p.waypoint = saved.waypoint.filter(|&r| self.world.room(r).is_some());
             p.visited = Arc::new(saved.visited.iter().copied().collect());
@@ -4303,6 +4392,7 @@ impl WorldState {
                 saved.starter_stage.min(chain_len)
             };
             p.starter_kills = saved.starter_kills;
+            p.ability_order = saved.ability_order.clone();
             p.rpg_mode = saved.rpg_mode;
             // Restore the chosen archetype (ignored if the key is unknown or no
             // longer matches the class, e.g. a respec/rename).
@@ -4452,6 +4542,7 @@ impl WorldState {
             pvp_kills: p.pvp_kills,
             starter_stage: p.starter_stage,
             starter_kills: p.starter_kills,
+            ability_order: p.ability_order.clone(),
         }))
     }
 
@@ -4715,7 +4806,6 @@ impl WorldState {
         let mut first_visit = false;
         if let Some(player) = self.players.get_mut(&user_id) {
             player.frontier_descent_pending = false;
-            player.previous_room = Some(from);
             player.room = dest;
             first_visit = Arc::make_mut(&mut player.visited).insert(dest);
         }
@@ -4904,7 +4994,6 @@ impl WorldState {
                     continue;
                 }
                 if let Some(p) = self.players.get_mut(&f) {
-                    p.previous_room = Some(from);
                     p.room = dest;
                     Arc::make_mut(&mut p.visited).insert(dest);
                 }
@@ -4955,7 +5044,6 @@ impl WorldState {
             return;
         }
         if let Some(p) = self.players.get_mut(&user_id) {
-            p.previous_room = Some(p.room);
             p.room = home;
             Arc::make_mut(&mut p.visited).insert(home);
         }
@@ -5050,7 +5138,6 @@ impl WorldState {
         }
         if let Some(p) = self.players.get_mut(&user_id) {
             p.gold -= WAYPOINT_WARP_COST;
-            p.previous_room = Some(p.room);
             p.room = dest;
             Arc::make_mut(&mut p.visited).insert(dest);
         }
@@ -5141,7 +5228,6 @@ impl WorldState {
             return;
         };
         if let Some(p) = self.players.get_mut(&user_id) {
-            p.previous_room = Some(p.room);
             p.room = haven;
             Arc::make_mut(&mut p.visited).insert(haven);
         }
@@ -5854,7 +5940,6 @@ impl WorldState {
             return;
         }
         if let Some(p) = self.players.get_mut(&user_id) {
-            p.previous_room = Some(p.room);
             p.room = dest;
             Arc::make_mut(&mut p.visited).insert(dest);
         }
@@ -6457,7 +6542,7 @@ impl WorldState {
         if player.respawn_at.is_some() {
             return;
         }
-        let known = unlocked_for(class, player.level);
+        let known = ordered_for(unlocked_for(class, player.level), &player.ability_order);
         let Some(ability) = known.get(slot.saturating_sub(1) as usize).copied() else {
             self.log_to(
                 user_id,
@@ -6506,6 +6591,58 @@ impl WorldState {
             p.cooldowns.insert(ability.id, ability.cooldown_ticks);
         }
         self.apply_ability(user_id, class, ability);
+    }
+
+    /// Swap two abilities on the player's action bar (1-based slots). Both must
+    /// name rows in the current ordered roster; the resulting order is written
+    /// back to `ability_order` so it persists across sessions.
+    fn swap_abilities(&mut self, user_id: Uuid, source: u8, target: u8) {
+        let Some(player) = self.players.get(&user_id) else {
+            return;
+        };
+        let Some(class) = player.class else {
+            return;
+        };
+        let known = ordered_for(unlocked_for(class, player.level), &player.ability_order);
+        let (Some(si), Some(ti)) = (
+            source.checked_sub(1).map(|i| i as usize),
+            target.checked_sub(1).map(|i| i as usize),
+        ) else {
+            return;
+        };
+        if si >= known.len() || ti >= known.len() || si == ti {
+            return;
+        }
+        let mut order: Vec<u32> = known.iter().map(|a| a.id).collect();
+        order.swap(si, ti);
+        let (src, dst) = (known[si].name, known[ti].name);
+        if let Some(p) = self.players.get_mut(&user_id) {
+            p.ability_order = order;
+        }
+        self.log_to(
+            user_id,
+            LogKind::System,
+            format!("{src} and {dst} trade places on your bar."),
+        );
+    }
+
+    /// Drop the player's custom ability-bar order, returning the bar to the
+    /// natural unlock order. Idempotent for a character who never reordered.
+    fn reset_ability_order(&mut self, user_id: Uuid) {
+        let Some(player) = self.players.get(&user_id) else {
+            return;
+        };
+        if player.ability_order.is_empty() {
+            return;
+        }
+        if let Some(p) = self.players.get_mut(&user_id) {
+            p.ability_order.clear();
+        }
+        self.log_to(
+            user_id,
+            LogKind::System,
+            "Your abilities are back in their natural order.".to_string(),
+        );
     }
 
     fn apply_ability(&mut self, user_id: Uuid, class: Class, ability: &Ability) {
@@ -7303,12 +7440,15 @@ impl WorldState {
                 self.log_to(
                     user_id,
                     LogKind::Loot,
-                    "  ⚔ You have reached the pinnacle - level 50, the height of your calling. Few ever stand here.".to_string(),
+                    format!(
+                        "  ⚔ You have reached the pinnacle - level {}, the height of your calling. Few ever stand here.",
+                        Class::MAX_LEVEL
+                    ),
                 );
-                self.log_all(
-                    "The bells of Embergate ring: an adventurer has reached level 50, the pinnacle of their calling!"
-                        .to_string(),
-                );
+                self.log_all(format!(
+                    "The bells of Embergate ring: an adventurer has reached level {}, the pinnacle of their calling!",
+                    Class::MAX_LEVEL
+                ));
             }
         }
     }
@@ -7483,7 +7623,6 @@ impl WorldState {
         match exit {
             Some((dir, dest)) => {
                 if let Some(player) = self.players.get_mut(&user_id) {
-                    player.previous_room = Some(room_id);
                     player.room = dest;
                     Arc::make_mut(&mut player.visited).insert(dest);
                 }
@@ -7711,23 +7850,87 @@ impl WorldState {
         }
     }
 
-    fn use_item(&mut self, user_id: Uuid, item_id: u32) {
-        let Some(it) = item(item_id) else { return };
-        // Poisons and oils aren't drunk - they coat your weapon.
-        if let Some(tier) = super::items::poison_tier(item_id) {
-            let per_tick = POISON_PER_TICK[(tier as usize).min(POISON_PER_TICK.len() - 1)];
-            self.coat_weapon(
+    /// Coat the weapon in one keystroke, for use at a zone gate or mid-fight,
+    /// so a coat never means opening the inventory panel and scrolling.
+    ///
+    /// The pick is the whole point. Every coat in the game now carries the same
+    /// rider, so the only thing that separates two of them is the school and
+    /// the school is entirely a matchup question - which means a blind "use the
+    /// biggest vial" key would throw the system away. The order is: a coat the
+    /// current foe is *weak* to, then any coat it does not *resist*, then the
+    /// highest tier, then whatever you picked last. With no foe locked on,
+    /// nothing is known about the matchup and it falls through to tier and
+    /// habit, which is the right answer at a gate.
+    ///
+    /// A healthy coat already on the weapon is never thrown away on a whim:
+    /// the key refuses while more than `COAT_TOPUP_AT` strikes remain, of any
+    /// school, unless the locked-on foe makes the switch worth it (weak to
+    /// the pick, or resists what the weapon carries). A nearly spent coat
+    /// tops up, or switches, freely.
+    fn coat_best(&mut self, user_id: Uuid) {
+        let Some(p) = self.players.get(&user_id) else {
+            return;
+        };
+        // The foe's profile, when there is one. A duelling opponent has no
+        // resist/weak profile at all, so a pvp target reads as neutral and the
+        // pick falls through to tier - correct, not a gap.
+        let profile = p
+            .target
+            .and_then(|mob_id| self.mobs.get(&mob_id))
+            .map(|m| m.spawn.profile);
+        let last = p.last_coat;
+        let live = p.weapon_coat;
+        let best = p
+            .inventory
+            .iter()
+            .filter_map(|&id| super::items::coat_school_tier(id).map(|(s, t)| (id, s, t)))
+            .max_by_key(|&(id, school, tier)| {
+                let weak = profile.is_some_and(|pr| pr.weak == Some(school));
+                let unresisted = !profile.is_some_and(|pr| pr.resist == Some(school));
+                (weak, unresisted, tier, Some(id) == last)
+            });
+        let Some((id, school, _)) = best else {
+            self.log_to(
                 user_id,
-                item_id,
-                DamageType::Poison,
-                per_tick,
-                POISON_CHARGES,
+                LogKind::System,
+                "You have no coating in your bag.".to_string(),
             );
             return;
+        };
+        // Refuse rather than throw a healthy coat's strikes away, whatever
+        // school it is. The one thing worth those strikes is a matchup the
+        // foe in front of you answers: weak to the pick, or resisting what
+        // the weapon carries. A nearly spent coat is a different matter:
+        // topping up before a fight is the reasonable thing to want, so that
+        // goes through.
+        if let Some((live_school, _, charges)) = live
+            && charges > COAT_TOPUP_AT
+        {
+            let upgrade = profile.is_some_and(|pr| {
+                (pr.weak == Some(school) && live_school != school)
+                    || (pr.resist == Some(live_school) && pr.resist != Some(school))
+            });
+            if !upgrade {
+                self.log_to(
+                    user_id,
+                    LogKind::System,
+                    format!(
+                        "Your weapon already carries {} ({charges} strikes left).",
+                        live_school.label()
+                    ),
+                );
+                return;
+            }
         }
-        if let Some((school, tier)) = super::items::oil_school_tier(item_id) {
-            let per_tick = OIL_PER_TICK[(tier as usize).min(OIL_PER_TICK.len() - 1)];
-            self.coat_weapon(user_id, item_id, school, per_tick, OIL_CHARGES);
+        self.use_item(user_id, id);
+    }
+
+    fn use_item(&mut self, user_id: Uuid, item_id: u32) {
+        let Some(it) = item(item_id) else { return };
+        // Coats aren't drunk - poison vials and oils alike coat your weapon.
+        if let Some((school, tier)) = super::items::coat_school_tier(item_id) {
+            let per_tick = COAT_PER_TICK[(tier as usize).min(COAT_PER_TICK.len() - 1)];
+            self.coat_weapon(user_id, item_id, school, per_tick, COAT_CHARGES);
             return;
         }
         let ItemKind::Consumable { heal, restore } = it.kind else {
@@ -7760,9 +7963,8 @@ impl WorldState {
         }
         // Cooked food grants a well-fed regen on top of its immediate heal, and
         // so do the rarest Sunderlakes fish (their "special" - see fish_well_fed).
-        let well_fed = super::items::food_tier(item_id)
-            .map(|t| 2 + t as i32)
-            .or_else(|| super::items::fish_well_fed(item_id));
+        let well_fed =
+            super::items::food_well_fed(item_id).or_else(|| super::items::fish_well_fed(item_id));
         if let Some(p) = self.players.get_mut(&user_id) {
             if let Some(pos) = p.inventory.iter().position(|i| *i == item_id) {
                 p.inventory.remove(pos);
@@ -7809,6 +8011,7 @@ impl WorldState {
                 p.inventory.remove(pos);
             }
             p.weapon_coat = Some((school, per_tick, charges));
+            p.last_coat = Some(item_id);
         }
         self.log_to(
             user_id,
@@ -8296,7 +8499,7 @@ impl WorldState {
                     user_id,
                     per_tick,
                     school,
-                    POISON_DOT_TICKS,
+                    COAT_DOT_TICKS,
                     DotSource::Coat,
                     coat_source(school),
                 );
@@ -8563,7 +8766,7 @@ impl WorldState {
                     attacker_id,
                     per_tick,
                     school,
-                    POISON_DOT_TICKS,
+                    COAT_DOT_TICKS,
                     DotSource::Coat,
                     coat_source(school),
                 );
@@ -9203,7 +9406,6 @@ impl WorldState {
         if let Some(player) = self.players.get_mut(&user_id) {
             player.hp = player.max_hp();
             player.resource = player.max_resource;
-            player.previous_room = Some(player.room);
             player.room = TEMPLE_ROOM;
             player.target = None;
             player.respawn_at = None;
@@ -10367,30 +10569,39 @@ impl WorldState {
             }
             // The crafting panel: every recipe worked at the stations in this room.
             let crafting = {
-                let stations = craft_stations_at(player.room);
+                let here = craft_stations_at(player.room);
+                let stations: Vec<CraftSkill> = CraftSkill::PANEL_ORDER
+                    .into_iter()
+                    .filter(|st| here.contains(st))
+                    .collect();
                 if stations.is_empty() {
                     None
                 } else {
                     let mut entries = Vec::new();
                     for &st in &stations {
                         let clevel = skill_level_for_xp(player.craft_xp(st));
+                        let first = entries.len();
                         for ri in recipe_indices_for(st) {
                             let Some(rc) = recipe(ri) else {
                                 continue;
                             };
-                            let inputs = rc
+                            let ingredients: Vec<CraftIngredientView> = rc
                                 .inputs
                                 .iter()
-                                .map(|ing| {
-                                    let n = item(ing.item).map(|i| i.name).unwrap_or("?");
-                                    format!("{}x {n}", ing.qty)
+                                .map(|ing| CraftIngredientView {
+                                    name: item(ing.item)
+                                        .map(|i| i.name.to_string())
+                                        .unwrap_or_else(|| "?".to_string()),
+                                    need: ing.qty,
+                                    have: player.item_count(ing.item),
                                 })
+                                .collect();
+                            let inputs = ingredients
+                                .iter()
+                                .map(|ing| format!("{}x {}", ing.need, ing.name))
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            let have_mats = rc
-                                .inputs
-                                .iter()
-                                .all(|ing| player.item_count(ing.item) >= ing.qty);
+                            let have_mats = ingredients.iter().all(|ing| ing.have >= ing.need);
                             let (craftable, reason) = if clevel < rc.level_req {
                                 (false, format!("needs {} {}", st.label(), rc.level_req))
                             } else if !have_mats {
@@ -10398,17 +10609,70 @@ impl WorldState {
                             } else {
                                 (true, String::new())
                             };
+                            // The output as a piece of gear, so the screen can
+                            // stand it against what is worn the way the shop
+                            // stands a listing against it.
+                            let out = item(rc.output);
+                            let worn = out
+                                .and_then(Item::slot)
+                                .and_then(|slot| player.equipped.get(&slot))
+                                .and_then(|id| item(*id))
+                                .filter(|worn| Some(worn.id) != out.map(|o| o.id));
                             entries.push(CraftEntryView {
                                 recipe: ri,
-                                name: item(rc.output)
-                                    .map(|i| i.name.to_string())
+                                item_id: rc.output,
+                                name: out.map(|i| i.name.to_string()).unwrap_or_default(),
+                                rarity: out
+                                    .map(|i| i.rarity.label().to_string())
                                     .unwrap_or_default(),
+                                qty: rc.output_qty,
                                 skill: st.label().to_string(),
+                                skill_level: clevel,
+                                level_req: rc.level_req,
+                                xp: rc.xp,
                                 inputs,
+                                ingredients,
+                                stats: out.map(Item::stat_summary).unwrap_or_default(),
+                                compare: out
+                                    .map(|i| compare_to_worn(&player.equipped, i))
+                                    .unwrap_or_default(),
+                                compare_pct: out.and_then(|i| player.compare_gear(i)),
+                                slot: out.and_then(Item::slot).map(|s| s.label().to_string()),
+                                worn_name: worn.map(|w| w.name.to_string()),
+                                worn_stats: worn.map(|w| w.stat_summary()),
+                                desc: out.map(|i| i.desc).unwrap_or(""),
+                                category: out.map(|i| item_category(&i.kind)).unwrap_or("Goods"),
+                                held: match out.map(|i| &i.kind) {
+                                    Some(
+                                        super::items::ItemKind::Consumable { .. }
+                                        | super::items::ItemKind::Utility,
+                                    ) => Some(player.item_count(rc.output)),
+                                    Some(
+                                        super::items::ItemKind::Equipment(_)
+                                        | super::items::ItemKind::Valuable,
+                                    )
+                                    | None => None,
+                                },
                                 craftable,
                                 reason,
                             });
                         }
+                        // Best first inside this trade, the way the shop orders
+                        // its stock: the tier a maker is reaching for sits at
+                        // the top of its skill, not wherever the recipe table
+                        // happened to put it. `power` orders gear, the level
+                        // gate stands in for everything else (a deeper draught
+                        // wants a deeper skill), and the recipe index keeps it
+                        // stable. Sorted per station so the sections themselves
+                        // still appear in station order.
+                        entries[first..].sort_by(|a, b| {
+                            let power =
+                                |e: &CraftEntryView| item(e.item_id).map(Item::power).unwrap_or(0);
+                            power(b)
+                                .cmp(&power(a))
+                                .then(b.level_req.cmp(&a.level_req))
+                                .then(a.recipe.cmp(&b.recipe))
+                        });
                     }
                     Some(CraftView {
                         stations: stations
@@ -10448,18 +10712,21 @@ impl WorldState {
                 };
 
             let abilities: Vec<AbilityView> = match player.class {
-                Some(c) => unlocked_for(c, player.level)
-                    .iter()
-                    .enumerate()
-                    .map(|(i, a)| AbilityView {
-                        slot: (i + 1) as u8,
-                        name: a.name.to_string(),
-                        cost: a.cost,
-                        ready: player.cooldowns.get(&a.id).copied().unwrap_or(0) == 0
-                            && player.resource >= a.cost,
-                        effect: a.effect.label().to_string(),
-                    })
-                    .collect(),
+                Some(c) => {
+                    let known = ordered_for(unlocked_for(c, player.level), &player.ability_order);
+                    known
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| AbilityView {
+                            slot: (i + 1) as u8,
+                            name: a.name.to_string(),
+                            cost: a.cost,
+                            ready: player.cooldowns.get(&a.id).copied().unwrap_or(0) == 0
+                                && player.resource >= a.cost,
+                            effect: a.effect_label(),
+                        })
+                        .collect()
+                }
                 None => Vec::new(),
             };
 
@@ -10754,9 +11021,6 @@ impl WorldState {
                 })
                 .collect();
 
-            let minimap =
-                self.world
-                    .minimap(player.room, player.previous_room, &player.visited, 3, 2);
             let atlas = self.world.region_progress(&player.visited, player.room);
             // The journal, in reading order: the active starter step first,
             // then accepted board bounties, then - only once the Frontier's
@@ -10860,7 +11124,10 @@ impl WorldState {
                     nearby_foes,
                     nearby_players,
                     rpg_mode: player.rpg_mode,
-                    waypoint_set: player.waypoint.is_some(),
+                    waypoint: player
+                        .waypoint
+                        .and_then(|room| self.world.room(room))
+                        .map(|room| room.zone.to_string()),
                     occupants,
                     following: player.following,
                     wildlife,
@@ -10870,9 +11137,10 @@ impl WorldState {
                     shield: player.shield,
                     empower: player.empower,
                     stunned: player.stunned > 0,
-                    coat: player
-                        .weapon_coat
-                        .map(|(school, _, charges)| format!("{} coat x{charges}", school.label())),
+                    coat: player.weapon_coat.map(|(school, _, charges)| CoatView {
+                        school: school.label().to_string(),
+                        charges,
+                    }),
                     abilities,
                     inventory,
                     shop,
@@ -10909,7 +11177,6 @@ impl WorldState {
                     resurrections_left: player.resurrections_left,
                     resurrection_cap: player.resurrection_cap,
                     features,
-                    minimap,
                     atlas,
                     time_of_day,
                     time_of_day_glyph,

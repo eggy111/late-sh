@@ -12,13 +12,12 @@ use uuid::Uuid;
 
 use late_core::{
     MutexRecover,
-    db::{Db, DbConfig},
+    db::Db,
     models::{
         character_sheet::{CharacterSheet, CharacterSheetParams},
         chat_message::{ChatMessage, ChatMessageParams, HistoryDirection},
         chat_message_gild::{
-            CHAT_MESSAGE_GILDED_CHANNEL, ChatMessageGild, ChatMessageGildSummary,
-            GILD_FEED_THRESHOLD, GildPlacement, GildTier, listen_for_gild_changes,
+            ChatMessageGild, ChatMessageGildSummary, GILD_FEED_THRESHOLD, GildPlacement, GildTier,
             parse_gilded_payload,
         },
         chat_message_reaction::{
@@ -30,10 +29,7 @@ use late_core::{
         chat_room_member::ChatRoomMember,
         chat_slow_mode::ChatSlowMode,
         chips::UserChips,
-        deadchannel_name_hit::{
-            DEADCHANNEL_NAME_HIT_CHANNEL, NameHitSignal, listen_for_name_hits, notify_name_hit,
-            parse_name_hit_payload,
-        },
+        deadchannel_name_hit::{NameHitSignal, notify_name_hit, parse_name_hit_payload},
         drinks::UserDrinks,
         message_translation::{TranslateLang, needs_translation},
         moderation_audit_log::ModerationAuditLog,
@@ -59,6 +55,7 @@ use crate::moderation::service::{
     target_tier_for_user_id,
 };
 use crate::moderation::session_effects::ModerationSessionEffects;
+use crate::pg_listener::{Channel, Signal};
 use crate::session::SessionRegistry;
 use crate::state::ActiveUsers;
 use crate::usernames::UsernameDirectory;
@@ -78,6 +75,9 @@ type HistoryPage = (Vec<ChatMessage>, HashMap<Uuid, String>);
 const MODERATORS_SLUG: &str = "moderators";
 
 const HISTORY_LIMIT: i64 = 500;
+/// Concurrent chat reads (room tails, discover) allowed at once; the rest
+/// queue on `read_permits`.
+const READ_PERMITS: usize = 8;
 const DELTA_LIMIT: i64 = 256;
 const CHAT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const USERNAME_DIRECTORY_TTL: Duration = Duration::from_secs(30);
@@ -162,6 +162,16 @@ impl ReportKind {
             _ => None,
         }
     }
+}
+
+/// What a game-room join found. Public game rooms (house tables, stream
+/// chats, match chats) take anyone who is not banned; a match claimed while
+/// match chat was players-only keeps a private room, and a spectator staying
+/// outside it is a normal answer, not a failure to report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GameRoomJoin {
+    Joined(Uuid),
+    PlayersOnly,
 }
 
 /// Why a gild did not happen. Every arm is a rule the buyer can act on, and
@@ -1173,9 +1183,15 @@ impl ChatService {
             refresh_scheduler_started: Arc::new(AtomicBool::new(false)),
             refresh_signal_tx,
             refresh_signal_rx: Arc::new(Mutex::new(Some(refresh_signal_rx))),
-            read_permits: Arc::new(Semaphore::new(8)),
+            read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
             system_user_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Put the read-permit semaphore on the dashboard. Called once at
+    /// startup.
+    pub fn observe_read_permits(&self) {
+        metrics::observe_chat_read_permits(self.read_permits.clone(), READ_PERMITS);
     }
 
     /// Publish the #lounge feed bot's id. Called once at startup by
@@ -3056,6 +3072,49 @@ impl ChatService {
         claim_rx
     }
 
+    /// The wire (GAME.md, "The three surfaces"): the game's log posts into
+    /// #deadchannel as real messages, from the voice for now (the
+    /// announcer's own name is a design-review question). Fire-and-forget:
+    /// nobody upstream waits on a line, so the failure is logged here. The
+    /// voice joins the room on first use; the room seeds itself the same
+    /// way the invited join seeds it.
+    pub fn post_wire_line_task(&self, body: String) {
+        let service = self.clone();
+        tokio::spawn(
+            async move {
+                let posted: anyhow::Result<()> = async {
+                    let voice = service.ensure_first_contact_voice().await?;
+                    let room_id = {
+                        let client = service.db.get().await?;
+                        let room = ChatRoom::get_or_create_deadchannel_room(&client).await?;
+                        ChatRoomMember::join(&client, room.id, voice.id).await?;
+                        room.id
+                    };
+                    service
+                        .send_message(SendMessageParams {
+                            user_id: voice.id,
+                            room_id,
+                            room_slug: None,
+                            body,
+                            reply_to_message_id: None,
+                            reply_to_user_id: None,
+                            is_admin: false,
+                        })
+                        .await
+                }
+                .await;
+                if let Err(error) = posted {
+                    late_core::error_span!(
+                        "deadchannel_wire_line_failed",
+                        error = ?error,
+                        "failed to post a line on the wire"
+                    );
+                }
+            }
+            .instrument(info_span!("chat.post_wire_line_task")),
+        );
+    }
+
     pub fn send_message_with_reply_task(&self, task: SendMessageTask) {
         let SendMessageTask {
             user_id,
@@ -4114,98 +4173,60 @@ impl ChatService {
         );
     }
 
-    /// Keep every replica's per-message markers in step. One long-lived
-    /// Postgres connection LISTENs on [`CHAT_MESSAGE_GILDED_CHANNEL`] and
-    /// [`DEADCHANNEL_NAME_HIT_CHANNEL`] and rebroadcasts each notification
-    /// locally; a dropped connection reconnects after five seconds, and
-    /// until it does gild markers only lag until the next room tail load
-    /// (a name hit fired meanwhile is simply not witnessed here). Same
-    /// shape as `ShopService::start_listener_task`.
-    pub fn start_message_listener_task(&self, db_config: DbConfig) -> tokio::task::JoinHandle<()> {
+    /// What the notify worker subscribes to.
+    pub const CHANNELS: &'static [Channel] =
+        &[Channel::ChatMessageGilded, Channel::DeadchannelNameHit];
+
+    /// Keep every replica's per-message markers in step: gilds and
+    /// deadchannel name hits are rebroadcast to this replica's sessions.
+    /// Nothing is re-read on a resync: while the listener reconnects, gild
+    /// markers only lag until the next room tail load, and a name hit fired
+    /// meanwhile is simply not witnessed here.
+    pub fn start_notify_worker(
+        &self,
+        mut signals: mpsc::UnboundedReceiver<Signal>,
+    ) -> tokio::task::JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
-            loop {
-                if let Err(error) = service.listen_for_message_events_once(&db_config).await {
-                    tracing::warn!(error = ?error, "chat message postgres listener stopped");
+            while let Some(signal) = signals.recv().await {
+                match signal {
+                    Signal::Resync => {}
+                    Signal::Notify {
+                        channel: Channel::ChatMessageGilded,
+                        payload,
+                    } => service.apply_gild_notification(&payload).await,
+                    Signal::Notify {
+                        channel: Channel::DeadchannelNameHit,
+                        payload,
+                    } => service.apply_name_hit(&payload),
+                    Signal::Notify { channel, .. } => {
+                        unreachable!("chat subscribed only to gilds and name hits, got {channel:?}")
+                    }
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         })
     }
 
-    async fn listen_for_message_events_once(&self, db_config: &DbConfig) -> Result<()> {
-        let mut config = tokio_postgres::Config::new();
-        config.host(&db_config.host);
-        config.port(db_config.port);
-        config.user(&db_config.user);
-        config.password(&db_config.password);
-        config.dbname(&db_config.dbname);
-
-        let (client, mut connection) = config.connect(tokio_postgres::NoTls).await?;
-        let listen = async {
-            listen_for_gild_changes(&client).await?;
-            listen_for_name_hits(&client).await
-        };
-        tokio::pin!(listen);
-        loop {
-            tokio::select! {
-                result = &mut listen => {
-                    result?;
-                    break;
-                }
-                message = std::future::poll_fn(|cx| connection.poll_message(cx)) => {
-                    let Some(message) = message else {
-                        return Ok(());
-                    };
-                    self.handle_message_notification(message?).await?;
-                }
+    fn apply_name_hit(&self, payload: &str) {
+        match parse_name_hit_payload(payload) {
+            Some(signal) => {
+                let _ = self.evt_tx.send(ChatEvent::NameHit {
+                    room_id: signal.room_id,
+                    message_id: signal.message_id,
+                    seed: signal.seed,
+                });
             }
-        }
-
-        loop {
-            let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await else {
-                return Ok(());
-            };
-            self.handle_message_notification(message?).await?;
+            None => tracing::warn!(payload, "unreadable deadchannel name hit payload"),
         }
     }
 
-    async fn handle_message_notification(
-        &self,
-        message: tokio_postgres::AsyncMessage,
-    ) -> Result<()> {
-        let tokio_postgres::AsyncMessage::Notification(notification) = message else {
-            return Ok(());
-        };
-        if notification.channel() == DEADCHANNEL_NAME_HIT_CHANNEL {
-            match parse_name_hit_payload(notification.payload()) {
-                Some(signal) => {
-                    let _ = self.evt_tx.send(ChatEvent::NameHit {
-                        room_id: signal.room_id,
-                        message_id: signal.message_id,
-                        seed: signal.seed,
-                    });
-                }
-                None => tracing::warn!(
-                    payload = notification.payload(),
-                    "unreadable deadchannel name hit payload"
-                ),
-            }
-            return Ok(());
-        }
-        if notification.channel() != CHAT_MESSAGE_GILDED_CHANNEL {
-            return Ok(());
-        }
-        let Some((message_id, room_id)) = parse_gilded_payload(notification.payload()) else {
-            tracing::warn!(
-                payload = notification.payload(),
-                "unparseable gild notification payload"
-            );
-            return Ok(());
+    async fn apply_gild_notification(&self, payload: &str) {
+        let Some((message_id, room_id)) = parse_gilded_payload(payload) else {
+            tracing::warn!(payload, "unparseable gild notification payload");
+            return;
         };
         // A failed lookup is this one marker lagging until the next tail
-        // load, not a reason to drop the LISTEN connection: propagating it
-        // would lose every gild committed during the reconnect window.
+        // load.
         let summary = match self.load_gild_summary(message_id).await {
             Ok(summary) => summary,
             Err(error) => {
@@ -4214,7 +4235,7 @@ impl ChatService {
                     message_id = %message_id,
                     "failed to load gild summary for notification"
                 );
-                return Ok(());
+                return;
             }
         };
         let _ = self.evt_tx.send(ChatEvent::MessageGildsUpdated {
@@ -4222,7 +4243,6 @@ impl ChatService {
             message_id,
             summary,
         });
-        Ok(())
     }
 
     async fn load_gild_summary(&self, message_id: Uuid) -> Result<Option<ChatMessageGildSummary>> {
@@ -4772,11 +4792,14 @@ impl ChatService {
         tokio::spawn(
             async move {
                 match service.join_game_room(user_id, room_id).await {
-                    Ok(room_id) => {
+                    Ok(GameRoomJoin::Joined(room_id)) => {
                         let _ = service
                             .evt_tx
                             .send(ChatEvent::GameRoomJoined { user_id, room_id });
                     }
+                    // Nothing to tell the user: the surface that asked for
+                    // this join draws no chat when the join does not land.
+                    Ok(GameRoomJoin::PlayersOnly) => {}
                     Err(e) => {
                         let _ = service.evt_tx.send(ChatEvent::RoomFailed {
                             user_id,
@@ -4801,7 +4824,11 @@ impl ChatService {
         Ok(room.id)
     }
 
-    pub(crate) async fn join_game_room(&self, user_id: Uuid, room_id: Uuid) -> Result<Uuid> {
+    pub(crate) async fn join_game_room(
+        &self,
+        user_id: Uuid,
+        room_id: Uuid,
+    ) -> Result<GameRoomJoin> {
         let client = self.db.get().await?;
         let room = ChatRoom::get(&client, room_id)
             .await?
@@ -4809,19 +4836,20 @@ impl ChatService {
         if room.kind != "game" {
             anyhow::bail!("Only game rooms can be joined here");
         }
-        // Private game rooms are daily match chats: membership is fixed at
-        // claim time to the two players, so joining is only the idempotent
-        // re-join that kicks off the tail/list refresh chain. Nobody else
-        // may enter.
+        // House tables, stream chats and match chats are public: anyone who
+        // opens the surface joins and talks. The one private flavor left is
+        // a match claimed while match chat was players-only, where the two
+        // memberships written at claim time are the whole room; a spectator
+        // walking into one stays out, which is an outcome and not an error.
         if room.visibility != "public"
             && !ChatRoomMember::is_member(&client, room.id, user_id).await?
         {
-            anyhow::bail!("this match chat is players only");
+            return Ok(GameRoomJoin::PlayersOnly);
         }
         // A ban is what keeps someone out of a public game room, and
         // `ChatRoomMember::join` is where that is enforced for every join path.
         ChatRoomMember::join(&client, room.id, user_id).await?;
-        Ok(room.id)
+        Ok(GameRoomJoin::Joined(room.id))
     }
 
     async fn open_public_room(&self, user_id: Uuid, slug: &str) -> Result<Uuid> {
@@ -4880,11 +4908,12 @@ impl ChatService {
         ChatRoomMember::join(&client, room.id, user_id).await?;
         tracing::info!(user_id = %user_id, username = %user.username, room_id = %room.id, "deadchannel joined by invitation");
         // Consent creates the character (GAME.md, Phase 2): the runner row,
-        // wearing a random starter look. A conditional insert, so a second
-        // device or a rejoin finds the runner already there and keeps its
-        // face; only a fresh row counts as the ladder's last beat, and the
-        // insert itself says which this was.
-        let look = crate::app::deadchannel::runner::state::Look::random(&mut rand::thread_rng());
+        // wearing a random level-1 look. A conditional insert, so a second
+        // device finds the runner already there and keeps its face, and a
+        // runner who left comes back wearing the same one; only a fresh row
+        // counts as the ladder's last beat, and the statements say which
+        // this was.
+        let look = crate::app::deadchannel::runner::state::Look::random(1, &mut rand::thread_rng());
         let (runner, origin) =
             late_core::models::deadchannel_runner::DeadchannelRunner::ensure_for_user(
                 &client,
@@ -4898,6 +4927,20 @@ impl ChatService {
                 crate::metrics::record_first_contact_beat(
                     crate::metrics::FirstContactBeat::RunnerCreated,
                 );
+                // The voice welcomes a new runner on the wire: the story,
+                // the keys, the rules, the way out. Once per person, because
+                // only the winning insert lands here; a return or a second
+                // device finds the welcome already in the room's history.
+                self.post_wire_line_task(crate::app::deadchannel::runner::data::welcome(
+                    &user.username,
+                ));
+            }
+            late_core::models::deadchannel_runner::RunnerOrigin::Returned => {
+                tracing::info!(user_id = %user_id, username = %user.username, runner_id = %runner.id, "runner returned");
+                crate::metrics::record_runner_door(crate::metrics::RunnerDoor::Returned);
+                // The wire hears who is around: the same conditional clear
+                // that reopened the door says this was the one join that did.
+                self.post_wire_line_task(format!("{} is back on the wire.", user.username));
             }
             late_core::models::deadchannel_runner::RunnerOrigin::Existing => {}
         }
@@ -4948,6 +4991,34 @@ impl ChatService {
             .await?;
         }
         Ok(())
+    }
+
+    /// Say a house line into `room_id` as the `system` author, off-thread.
+    /// The Nightcap's one caller (`clubhouse/nightcap/svc.rs`) announces
+    /// every drink the bar pours; nothing waits on it, so a failure is
+    /// logged here and nowhere else.
+    ///
+    /// No `· ` prefix: a prefixed line is an ambient #lounge feed line the
+    /// TUI diverts into the activity ticker and strips out of every room's
+    /// messages, and this one has to read as a message on the wall out back.
+    /// The system user is ensured at startup by the lounge feed task; before
+    /// that lands (or with the feed disabled) the house says nothing.
+    pub fn send_house_line_task(&self, room_id: Uuid, body: String) {
+        let Some(system_user_id) = self.system_user_id() else {
+            return;
+        };
+        let service = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = service
+                .send_system_message(system_user_id, room_id, body)
+                .await
+            {
+                crate::metrics::record_nightcap_house_failure(
+                    crate::app::clubhouse::nightcap::svc::NightcapHouseFailure::HouseLine,
+                );
+                tracing::warn!(error = ?error, room_id = %room_id, "failed to post a house line");
+            }
+        });
     }
 
     /// Post `body` into `room_id` as the system bot, joining it to the room
@@ -5162,7 +5233,36 @@ impl ChatService {
             let name = room.slug.as_deref().unwrap_or("this room");
             anyhow::bail!("Cannot leave #{name} (permanent room)");
         }
+        // The name for the wire's "went dark" line, read before anything
+        // is written: a lookup that fails here fails the leave whole, never
+        // after the membership and the stamp have already landed.
+        let deadchannel_username = match room.kind == late_core::models::chat_room::DEADCHANNEL_KIND
+        {
+            true => match User::get(&client, user_id).await? {
+                Some(user) => Some(user.username),
+                None => anyhow::bail!("user not found"),
+            },
+            false => None,
+        };
         ChatRoomMember::leave(&client, room_id, user_id).await?;
+        // Leaving #deadchannel closes the undercity gate, on this replica
+        // and every other: the stamp fires `deadchannel_runner_changed`, so
+        // the runner drops out of each replica's looks directory and out of
+        // `App::is_runner` on the next tick edge. The character survives the
+        // leave, so an invited rejoin gets the same face back.
+        if let Some(username) = deadchannel_username {
+            let left = late_core::models::deadchannel_runner::DeadchannelRunner::mark_left(
+                &client, user_id,
+            )
+            .await?;
+            if left {
+                tracing::info!(user_id = %user_id, username = %username, "runner left the deadchannel");
+                crate::metrics::record_runner_door(crate::metrics::RunnerDoor::Left);
+                // Going dark is news, once: the conditional stamp says this
+                // was the leave that shut the door.
+                self.post_wire_line_task(format!("{username} went dark."));
+            }
+        }
         Ok(())
     }
 

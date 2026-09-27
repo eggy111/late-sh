@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -24,14 +26,17 @@ const NEWS_SEPARATOR: &str = " || ";
 /// untouched; `title_range` is the `, <title>` that follows it, painted in
 /// the dim label color because a title is text, not another name. `word`
 /// pairs the printed drunk state with the dim hue that carries it (green
-/// tipsy through red wasted). The effect fg deliberately overrides the base
-/// author fg (own amber, friend gold, default) while keeping its modifiers,
-/// so a bought effect always wins the color of the name.
+/// tipsy through red wasted). `runner` is the ` ▚7` level badge that opens
+/// the badge stack on the wire, with the color of its level band. The
+/// effect fg deliberately overrides the base author fg (own amber, friend
+/// gold, default) while keeping its modifiers, so a bought effect always
+/// wins the color of the name.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AuthorTint {
     pub range: (usize, usize),
     pub crown_range: Option<(usize, usize)>,
     pub title_range: Option<(usize, usize)>,
+    pub runner: Option<((usize, usize), Color)>,
     pub word: Option<(&'static str, Color)>,
     pub name_style: Option<NameStyle>,
 }
@@ -91,14 +96,19 @@ fn push_author_prefix_spans(
         None => spans.push(Span::styled(name.to_string(), author_style)),
     }
 
-    // The crown and the rented title trail the name directly, in that order,
-    // each painted in its own color so neither takes the name's effect. A
-    // range that does not sit exactly where the builder put it is left to
-    // the tail rather than trusted.
+    // The crown, the rented title, and the runner badge trail the name
+    // directly, in that order, each painted in its own color so none takes
+    // the name's effect. A range that does not sit exactly where the
+    // builder put it is left to the tail rather than trusted.
     let mut cursor = end;
+    let (runner_range, runner_style) = match tint.runner {
+        Some((range, color)) => (Some(range), Style::default().fg(color)),
+        None => (None, Style::default()),
+    };
     for (range, style) in [
         (tint.crown_range, Style::default().fg(theme::AMBER_GLOW())),
         (tint.title_range, Style::default().fg(theme::TEXT_DIM())),
+        (runner_range, runner_style),
     ] {
         let Some((from, to)) = range else { continue };
         if from != cursor || to <= from || to > prefix.len() || !prefix.is_char_boundary(to) {
@@ -712,6 +722,27 @@ pub(super) fn reaction_label(kind: i16) -> &'static str {
 }
 
 // ── Text utilities ──────────────────────────────────────────
+
+/// Nerd Font icons sit in Unicode's Private Use Areas (the BMP block and the
+/// two supplementary planes, where the Material Design set lives). Nothing
+/// else late.sh draws is there, so a terminal font without them only ever
+/// meets them in what people post from the icon picker.
+pub(super) fn is_nerd_font_glyph(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}'
+    )
+}
+
+/// `text` with every Nerd Font glyph dropped: the plain-glyphs setting
+/// (`show_flag_fallback`) renders them as nothing rather than as tofu.
+pub(super) fn without_nerd_font_glyphs(text: &str) -> Cow<'_, str> {
+    if text.chars().any(is_nerd_font_glyph) {
+        Cow::Owned(text.chars().filter(|ch| !is_nerd_font_glyph(*ch)).collect())
+    } else {
+        Cow::Borrowed(text)
+    }
+}
 
 fn normalize_inline_text(text: &str) -> String {
     text.lines()

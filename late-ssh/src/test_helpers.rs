@@ -241,6 +241,11 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         ai_service.clone(),
         test_app_flags_rx(),
     );
+    let jobs_service = crate::app::jobs::svc::JobsService::new(
+        db.clone(),
+        ai_service.clone(),
+        test_app_flags_rx(),
+    );
     let article_service = ArticleService::new(db.clone(), ai_service.clone(), chat_service.clone());
     let feed_service = crate::app::chat::feeds::svc::FeedService::new(db.clone());
     let showcase_service = crate::app::chat::showcase::svc::ShowcaseService::new(db.clone());
@@ -298,13 +303,17 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         pair_ws_counts: Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new())),
         active_users,
         clubhouse_lobby: crate::app::clubhouse::lobby::SharedLobby::with_seed(7),
+        nightcap_lobby: crate::app::clubhouse::nightcap::lobby::SharedSeats::new(),
+        nightcap_house: crate::app::clubhouse::nightcap::svc::NightcapHouse::new(
+            db.clone(),
+            crate::app::clubhouse::nightcap::wall::SharedWall::new(),
+        ),
         mention_ladders: crate::app::ai::ladder::MentionLadders::new(),
         scratchpad_registry: crate::app::scratchpad::registry::SharedScratchpadRegistry::new(),
         app_flags: crate::app::flags::svc::AppFlagService::new(db.clone()),
         runner_looks: crate::app::deadchannel::runner::svc::RunnerLookService::new(db.clone()),
         username_directory,
         flair_directory: crate::app::common::username_effect::new_directory(),
-        status_directory: crate::app::common::status::new_directory(),
         crown_service: crate::app::crown::svc::CrownService::new(db.clone()),
         pot_service: crate::app::pot::svc::PotService::new(db.clone()),
         config,
@@ -323,6 +332,7 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         translation_service,
         summary_service,
         paper_service,
+        jobs_service,
         article_service,
         feed_service,
         cyberspace_service: crate::app::chat::cyberspace::svc::CyberspaceService::new(
@@ -512,6 +522,11 @@ fn make_app_with_chat_service_and_permissions(
             AiService::new(false, None),
             test_app_flags_rx(),
         ),
+        jobs_service: crate::app::jobs::svc::JobsService::new(
+            db.clone(),
+            AiService::new(false, None),
+            test_app_flags_rx(),
+        ),
         notification_service: notification_service.clone(),
         article_service: ArticleService::new(
             db.clone(),
@@ -594,6 +609,12 @@ fn make_app_with_chat_service_and_permissions(
         ),
         username: world.username.unwrap_or_else(|| "test-user".to_string()),
         bonsai_service: BonsaiService::new(db.clone(), broadcast::channel::<ActivityEvent>(64).0),
+        fight_service: crate::app::deadchannel::fight::svc::FightService::new(
+            db.clone(),
+            chat_service.clone(),
+        ),
+        tailor_service: crate::app::deadchannel::tailor::svc::TailorService::new(db.clone()),
+        guide_service: crate::app::deadchannel::guide::svc::GuideService::new(db.clone()),
         initial_bonsai_tree: None,
         initial_bonsai_decay_protection: None,
         pet_service: PetService::new(db.clone(), broadcast::channel::<ActivityEvent>(64).0),
@@ -664,6 +685,8 @@ fn make_app_with_chat_service_and_permissions(
         artboard_ban_expires_at: None,
         active_users: world.active_users,
         clubhouse_lobby: None,
+        nightcap_lobby: None,
+        nightcap_house: None,
         mention_ladders: crate::app::ai::ladder::MentionLadders::new(),
         files: None,
         scratchpad_registry: world.scratchpad_registry,
@@ -685,7 +708,6 @@ fn make_app_with_chat_service_and_permissions(
         key_left_at: None,
         username_directory: None,
         flair_directory: None,
-        status_directory: None,
         crown_service: None,
         pot_service: None,
         activity_feed_rx: None,
@@ -762,6 +784,11 @@ pub fn make_app_with_paired_client(
             AiService::new(false, None),
         ),
         paper_service: crate::app::paper::svc::PaperService::new(
+            db.clone(),
+            AiService::new(false, None),
+            test_app_flags_rx(),
+        ),
+        jobs_service: crate::app::jobs::svc::JobsService::new(
             db.clone(),
             AiService::new(false, None),
             test_app_flags_rx(),
@@ -848,6 +875,12 @@ pub fn make_app_with_paired_client(
         ),
         username: "test-user".to_string(),
         bonsai_service: BonsaiService::new(db.clone(), broadcast::channel::<ActivityEvent>(64).0),
+        fight_service: crate::app::deadchannel::fight::svc::FightService::new(
+            db.clone(),
+            ChatService::new(db.clone(), notification_service.clone()),
+        ),
+        tailor_service: crate::app::deadchannel::tailor::svc::TailorService::new(db.clone()),
+        guide_service: crate::app::deadchannel::guide::svc::GuideService::new(db.clone()),
         initial_bonsai_tree: None,
         initial_bonsai_decay_protection: None,
         pet_service: PetService::new(db.clone(), broadcast::channel::<ActivityEvent>(64).0),
@@ -918,6 +951,8 @@ pub fn make_app_with_paired_client(
         artboard_ban_expires_at: None,
         active_users: None,
         clubhouse_lobby: None,
+        nightcap_lobby: None,
+        nightcap_house: None,
         mention_ladders: crate::app::ai::ladder::MentionLadders::new(),
         files: None,
         scratchpad_registry: None,
@@ -939,7 +974,6 @@ pub fn make_app_with_paired_client(
         key_left_at: None,
         username_directory: None,
         flair_directory: None,
-        status_directory: None,
         crown_service: None,
         pot_service: None,
         activity_feed_rx: None,
@@ -1167,6 +1201,7 @@ pub fn test_app_flags_rx()
         paper_enabled: true,
         paper_outside_enabled: false,
         artboard_gallery_enabled: true,
+        jobs_enabled: true,
     }));
     rx
 }

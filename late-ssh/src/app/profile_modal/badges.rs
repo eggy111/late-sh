@@ -71,22 +71,22 @@ pub(crate) fn guide_lines() -> Vec<Line<'static>> {
         Line::from(Span::styled(
             "Snapshotted at month end from last month's totals on the boards to the left. Top 3 only, \
              rank digit 1-3 (AW1 is that month's #1). Prestige only, no chips of their own, with two \
-             exceptions: the crown has one holder, so no digit; and the Artboard gallery pays its \
-             three places 20,000 / 10,000 / 5,000 chips.",
+             exceptions: the crown and Late Time each have one holder, so no digit; and the Artboard \
+             gallery pays its three places 40,000 / 15,000 / 10,000 chips.",
             dim,
         )),
         Line::from(""),
     ];
     for (item_code, name, source) in [
         (
-            "CHIP",
-            "Top Chips",
-            "last month's chips earned (Top Chips board; table money, gifts, and spending ignored)",
-        ),
-        (
             "AW",
             "Arcade Wins",
             "last month's daily-puzzle points (Arcade Wins board)",
+        ),
+        (
+            "CHIP",
+            "Top Chips",
+            "last month's chips earned (Top Chips board; table money, gifts, and spending ignored)",
         ),
         ("LA", "Lateris", "best Tetris score last month"),
         ("24#", "2048", "best 2048 score last month"),
@@ -100,6 +100,11 @@ pub(crate) fn guide_lines() -> Vec<Line<'static>> {
             "ART",
             "Artboard Gallery",
             "last month's most applauded piece, one per hanger, 3 applause to count (Artboard page, Hang a piece); pays 40,000 / 15,000 / 10,000 chips",
+        ),
+        (
+            "LATE",
+            "Late Time",
+            "most time online last month, first place only (Late Time board)",
         ),
     ] {
         lines.push(entry_line(item_code, name, source, code, text, dim));
@@ -145,6 +150,11 @@ pub(crate) fn guide_lines() -> Vec<Line<'static>> {
             "ascend to demigodhood (40,000 chips per run, 7-day gap)",
         ),
         (
+            "GDS",
+            "Green Dragon Slayer",
+            "slay the green dragon (10,000 chips, every kill)",
+        ),
+        (
             "DCO",
             "DCSS Orb of Zot",
             "pick up the Orb of Zot (20,000 chips per run, 7-day gap)",
@@ -165,11 +175,6 @@ pub(crate) fn guide_lines() -> Vec<Line<'static>> {
             "the Dungeons of Doom's super-victory (40,000 chips per run, 7-day gap)",
         ),
         (
-            "GDS",
-            "Green Dragon Slayer",
-            "slay the green dragon (10,000 chips, every kill)",
-        ),
-        (
             "ADE",
             "A Dark Room Escape",
             "fly the starship off the rock (15,000 chips, every run)",
@@ -178,6 +183,11 @@ pub(crate) fn guide_lines() -> Vec<Line<'static>> {
             "ADB",
             "A Dark Room Homefleet",
             "fly out holding the fleet beacon (20,000 chips, every run)",
+        ),
+        (
+            "SIG",
+            "Old Signal",
+            "put down the Old Signal in deadchannel (no chips: the mark is the prize)",
         ),
     ] {
         lines.push(entry_line(item_code, name, source, code, text, dim));

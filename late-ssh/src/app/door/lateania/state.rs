@@ -94,6 +94,8 @@ pub enum Panel {
 pub enum ClickAction {
     Attack,
     Quaff,
+    /// Coat the weapon with the best-matched coat in the bag.
+    Coat,
     Flee,
     Ability(u8),
     /// Lock onto the foe with this spawn id (a click on its roster row).
@@ -166,6 +168,10 @@ pub struct State {
     join_requested_at: Instant,
     reset_version: u64,
     reset_elsewhere: bool,
+    /// In the Abilities panel: the 1-based slot armed for swapping (`x`), if
+    /// the player pressed `x` once and is now picking the target row. Local to
+    /// this session only; the persisted result is the reordered ability list.
+    ability_swap_source: Option<u8>,
     /// The chat line being composed, if the player is typing (Some = compose
     /// mode captures keys). Chat is world-local via the service's `say`, so it
     /// never leaks into late.sh's global feed.
@@ -182,6 +188,13 @@ pub struct State {
     /// Which page of the map `m` is showing. Always reopens on the field, so
     /// `m` means the same thing every time it is pressed from the room.
     map_mode: MapMode,
+    /// Whether the terminal the render pass last drew into could hold the land
+    /// map. The land picture is a fixed 76x13 drawing that cannot be shrunk, so
+    /// on a phone `m` would otherwise cycle into a page that falls back to the
+    /// text atlas - a second press that appears to do nothing useful. The
+    /// render pass sets this each frame (the same way it hands back
+    /// `list_scroll`), and `cycle_map` skips the page when it is false.
+    lands_available: Cell<bool>,
     /// A room the player has marked to travel back to (`x` on the map's
     /// crosshair, or Enter on a journal quest row). Local to the session and
     /// never persisted: it is a note to oneself, not world truth.
@@ -227,10 +240,12 @@ impl State {
             join_requested_at,
             reset_version,
             reset_elsewhere: false,
+            ability_swap_source: None,
             chat_buffer: None,
             leave_confirm_until: None,
             map_camera: MapCamera::default(),
             map_mode: MapMode::Field,
+            lands_available: Cell::new(true),
             map_dest: None,
             map_quests: true,
             route_cache: RefCell::new(None),
@@ -308,12 +323,19 @@ impl State {
         self.cursor
     }
 
+    /// The 1-based ability slot currently armed for swapping in the Abilities
+    /// panel, if any.
+    pub fn ability_swap_source(&self) -> Option<u8> {
+        self.ability_swap_source
+    }
+
     pub fn set_panel(&mut self, panel: Panel) {
         if self.panel != panel {
             self.panel = panel;
             self.cursor = 0;
             self.list_scroll.set(0);
             self.map_camera.recenter();
+            self.ability_swap_source = None;
         }
     }
 
@@ -326,6 +348,7 @@ impl State {
         self.cursor = 0;
         self.list_scroll.set(0);
         self.map_camera.recenter();
+        self.ability_swap_source = None;
     }
 
     /// True when the graphical overhead world map is the active panel.
@@ -338,6 +361,11 @@ impl State {
         self.map_mode
     }
 
+    /// Told by the render pass whether this terminal can draw the land map.
+    pub fn set_lands_available(&self, yes: bool) {
+        self.lands_available.set(yes);
+    }
+
     /// `m`: closed -> the overhead field -> the land graph -> closed. One key
     /// walks the whole map, from the ground under your feet out to how the
     /// countries hang together.
@@ -346,6 +374,12 @@ impl State {
             (false, _) => {
                 self.map_mode = MapMode::Field;
                 self.set_panel(Panel::Map);
+            }
+            // On a terminal too small for the land picture the cycle is two
+            // states, not three: field -> closed. Better one key that always
+            // does something than a page that silently degrades.
+            (true, MapMode::Field) if !self.lands_available.get() => {
+                self.set_panel(Panel::Room);
             }
             (true, MapMode::Field) => {
                 self.map_mode = MapMode::Lands;
@@ -858,6 +892,45 @@ impl State {
         }
     }
 
+    /// `x` inside the Abilities panel: the first press arms the highlighted row
+    /// as the swap source, the second press (on another row) swaps the two. A
+    /// second press on the same row cancels the swap.
+    pub fn ability_swap_selection(&mut self) {
+        if self.panel != Panel::Abilities {
+            return;
+        }
+        if !self.ensure_player_present() {
+            return;
+        }
+        let slot = match self.view().abilities.get(self.cursor) {
+            Some(a) => a.slot,
+            None => return,
+        };
+        match self.ability_swap_source {
+            None => self.ability_swap_source = Some(slot),
+            Some(source) => {
+                self.ability_swap_source = None;
+                if source != slot {
+                    self.svc.swap_ability_task(self.user_id, source, slot);
+                }
+            }
+        }
+    }
+
+    /// `r` while a swap source is armed in the Abilities panel: drop the saved
+    /// custom order and return the bar to its natural unlock order. Only offered
+    /// in swap mode so `r` keeps its recall meaning everywhere else.
+    pub fn ability_reset_order(&mut self) {
+        if self.panel != Panel::Abilities || self.ability_swap_source.is_none() {
+            return;
+        }
+        if !self.ensure_player_present() {
+            return;
+        }
+        self.ability_swap_source = None;
+        self.svc.reset_ability_order_task(self.user_id);
+    }
+
     pub fn flee(&mut self) {
         if self.ensure_player_present() {
             self.svc.flee_task(self.user_id);
@@ -869,6 +942,15 @@ impl State {
     pub fn quaff(&mut self) {
         if self.ensure_player_present() {
             self.svc.quaff_task(self.user_id);
+        }
+    }
+
+    /// Coat the weapon without leaving the combat view, picking the coat the
+    /// foe in front of you likes least. The inventory panel still works; this
+    /// is so a coat doesn't cost a panel and a scroll every forty strikes.
+    pub fn coat(&mut self) {
+        if self.ensure_player_present() {
+            self.svc.coat_task(self.user_id);
         }
     }
 
@@ -897,6 +979,7 @@ impl State {
         match action {
             ClickAction::Attack => self.attack(),
             ClickAction::Quaff => self.quaff(),
+            ClickAction::Coat => self.coat(),
             ClickAction::Flee => self.flee(),
             ClickAction::Ability(slot) => self.use_ability(slot),
             ClickAction::AttackMob(mob_id) => self.attack_mob(mob_id),

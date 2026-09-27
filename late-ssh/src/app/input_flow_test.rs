@@ -533,17 +533,109 @@ async fn profiles_page_keys_drive_the_merged_feed() {
     app.handle_input(b"5");
     wait_for_render_contains(&mut app, " Profiles ").await;
 
-    // `i` opens the project (showcase) composer, Esc closes it.
+    // `i` opens the profile editor on a blank project form. The form's first
+    // row is already being typed into, so one Esc stops typing and a second
+    // leaves the untouched form for the projects list; a third closes.
     app.handle_input(b"i");
-    wait_for_render_contains(&mut app, " New showcase ").await;
+    wait_for_render_contains(&mut app, " Your profile ").await;
+    assert!(app.directory_editor.editing());
     app.handle_input(b"\x1b");
-    wait_for_esc_effect(&mut app, |app| !app.chat.showcase.composing(), "showcase").await;
+    wait_for_esc_effect(
+        &mut app,
+        |app| !app.directory_editor.editing(),
+        "stop typing",
+    )
+    .await;
+    app.handle_input(b"\x1b");
+    wait_for_esc_effect(
+        &mut app,
+        |app| {
+            matches!(
+                app.directory_editor.projects_view(),
+                crate::app::directory::editor::state::ProjectsView::List { .. }
+            )
+        },
+        "back to the list",
+    )
+    .await;
 
-    // `w` opens the work-card composer, Esc closes it.
-    app.handle_input(b"w");
-    wait_for_render_contains(&mut app, " New work profile ").await;
+    // `a` on the list opens a fresh project form; the letter arrives through
+    // the real parser, so this pins the list keys end to end. Esc twice
+    // returns to the list and closes the editor.
+    app.handle_input(b"a");
+    assert!(
+        app.directory_editor.editing(),
+        "`a` should open a new project form"
+    );
     app.handle_input(b"\x1b");
-    wait_for_esc_effect(&mut app, |app| !app.chat.work.composing(), "work").await;
+    wait_for_esc_effect(
+        &mut app,
+        |app| !app.directory_editor.editing(),
+        "stop typing again",
+    )
+    .await;
+    app.handle_input(b"\x1b");
+    wait_for_esc_effect(
+        &mut app,
+        |app| {
+            matches!(
+                app.directory_editor.projects_view(),
+                crate::app::directory::editor::state::ProjectsView::List { .. }
+            )
+        },
+        "back to the list again",
+    )
+    .await;
+    app.handle_input(b"\x1b");
+    wait_for_esc_effect(
+        &mut app,
+        |app| !app.directory_editor.is_open(),
+        "editor closed",
+    )
+    .await;
+
+    // `w` opens the same editor on the card page, Esc closes it untouched.
+    app.handle_input(b"w");
+    wait_for_render_contains(&mut app, " Your profile ").await;
+    assert_eq!(
+        app.directory_editor.page(),
+        crate::app::directory::editor::state::Page::Card
+    );
+    app.handle_input(b"\x1b");
+    wait_for_esc_effect(
+        &mut app,
+        |app| !app.directory_editor.is_open(),
+        "editor closed",
+    )
+    .await;
+
+    // A touched card asks before closing. Only `y` discards: Enter, the key
+    // a hand lands on by reflex, keeps the question up.
+    app.handle_input(b"w");
+    wait_for_render_contains(&mut app, " Your profile ").await;
+    app.handle_input(b"\rx");
+    assert!(app.directory_editor.dirty(), "typed into the headline");
+    app.handle_input(b"\x1b");
+    wait_for_esc_effect(
+        &mut app,
+        |app| !app.directory_editor.editing(),
+        "stop typing the headline",
+    )
+    .await;
+    app.handle_input(b"\x1b");
+    wait_for_esc_effect(
+        &mut app,
+        |app| app.directory_editor.confirm_discard(),
+        "asked to discard",
+    )
+    .await;
+    app.handle_input(b"\r");
+    assert!(
+        app.directory_editor.confirm_discard() && app.directory_editor.is_open(),
+        "enter must not discard"
+    );
+    app.handle_input(b"y");
+    assert!(!app.directory_editor.is_open(), "y discards and closes");
 
     // `s` opens feed search, Esc dismisses it.
     app.handle_input(b"s");
@@ -621,6 +713,176 @@ async fn tab_cycles_screens_forward_through_all_including_profiles() {
 
     app.handle_input(b"\t");
     wait_for_render_contains(&mut app, " Home ").await;
+}
+
+#[tokio::test]
+async fn zero_twice_goes_under_the_clubhouse_for_runners_only() {
+    use crate::app::deadchannel::runner::state::Look;
+    use crate::app::deadchannel::runner::svc::RunnerEntry;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, "undercity-it").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut app = make_app(test_db.db.clone(), user.id, "undercity-flow-it");
+
+    // Not a runner: `0` lands on the clubhouse and stays there.
+    app.handle_input(b"1");
+    wait_for_render_contains(&mut app, " Home ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    assert_render_not_contains_for(&mut app, " Undercity ", Duration::from_millis(200)).await;
+
+    // A runner: the second `0` goes under, the next one comes back up.
+    let mut rng = StdRng::seed_from_u64(7);
+    app.runner_looks = Arc::new(HashMap::from([(
+        user.id,
+        RunnerEntry {
+            look: Look::random(1, &mut rng),
+            level: 1,
+            peak_level: 1,
+            marks: 0,
+        },
+    )]));
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+}
+
+/// `/leave #deadchannel` on one session closes the street under every
+/// session the runner has open, on this replica and every other: the looks
+/// directory drops them, and the tick edge that copies it walks them back
+/// up. The gate on `0` only guards the descent.
+#[tokio::test]
+async fn leaving_the_deadchannel_walks_a_standing_runner_back_up() {
+    use crate::app::deadchannel::runner::state::Look;
+    use crate::app::deadchannel::runner::svc::RunnerEntry;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, "undercity-leave-it").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut app = make_app(test_db.db.clone(), user.id, "undercity-leave-flow-it");
+
+    // A live directory, the shape the replica's listener feeds.
+    let mut rng = StdRng::seed_from_u64(7);
+    let (looks_tx, looks_rx) = tokio::sync::watch::channel(Arc::new(HashMap::from([(
+        user.id,
+        RunnerEntry {
+            look: Look::random(1, &mut rng),
+            level: 1,
+            peak_level: 1,
+            marks: 0,
+        },
+    )])));
+    app.runner_looks = looks_rx.borrow().clone();
+    app.runner_looks_rx = looks_rx;
+
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+
+    // The leave lands (on any session, on any replica): the directory drops
+    // the runner, and this session cannot stay down there.
+    looks_tx.send_replace(Arc::new(HashMap::new()));
+    wait_for_render_not_contains(&mut app, " Undercity ").await;
+    assert!(!app.is_runner());
+    let frame = render_plain(&mut app);
+    assert!(
+        frame.contains(" Clubhouse "),
+        "expected the leave to walk the runner up to the clubhouse; frame={frame:?}"
+    );
+}
+
+/// A runner's session parked on the Undercity, one row north of the wire
+/// stairs: at the railing, where the popover offers the ledge.
+async fn runner_at_the_railing(
+    name: &str,
+) -> (late_core::test_utils::TestDb, crate::app::state::App) {
+    use crate::app::deadchannel::runner::state::Look;
+    use crate::app::deadchannel::runner::svc::RunnerEntry;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, name).await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut app = make_app(test_db.db.clone(), user.id, &format!("{name}-flow"));
+    let mut rng = StdRng::seed_from_u64(7);
+    app.runner_looks = Arc::new(HashMap::from([(
+        user.id,
+        RunnerEntry {
+            look: Look::random(1, &mut rng),
+            level: 1,
+            peak_level: 1,
+            marks: 0,
+        },
+    )]));
+
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+    app.handle_input(b"k");
+    wait_for_render_contains(&mut app, "look over").await;
+    (test_db, app)
+}
+
+#[tokio::test]
+async fn esc_steps_back_from_the_ledge() {
+    let (_test_db, mut app) = runner_at_the_railing("undercity-esc-it").await;
+
+    app.handle_input(b"\r");
+    wait_for_render_contains(&mut app, "step back").await;
+    // A lone Esc lands on a later tick; the render wait ticks it in.
+    app.handle_input(b"\x1b");
+    wait_for_render_not_contains(&mut app, "step back").await;
+    wait_for_render_contains(&mut app, "look over").await;
+}
+
+#[tokio::test]
+async fn leaving_the_city_mid_look_closes_it_for_the_next_descent() {
+    let (_test_db, mut app) = runner_at_the_railing("undercity-leave-it").await;
+
+    app.handle_input(b"\r");
+    wait_for_render_contains(&mut app, "step back").await;
+    // Up with the page key while looking over, then back down: the street,
+    // not the old view.
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+    assert_render_not_contains_for(&mut app, "step back", Duration::from_millis(200)).await;
+    wait_for_render_contains(&mut app, "look over").await;
 }
 
 #[tokio::test]
@@ -732,7 +994,7 @@ async fn slash_lobby_zen_and_guide_mirror_their_keys() {
     app.handle_input(b"\x06");
     assert_eq!(app.screen, Screen::Dashboard);
 
-    // /redraw re-emits every cell, the way Ctrl+L does: the frame after it
+    // /redraw re-emits every cell, the way Ctrl+R does: the frame after it
     // carries more than a settled diff.
     let _ = app.render().expect("render");
     let settled = strip_ansi(&String::from_utf8_lossy(&app.render().expect("render")));
@@ -866,6 +1128,17 @@ async fn artboard_view_help_and_active_input_share_one_lifecycle() {
     app.handle_input(b"\r");
     app.handle_input(b"\x1b[C");
     wait_for_render_contains(&mut app, "Cursor     1,0").await;
+
+    // Vim keys move the view-mode cursor like the arrows, and never paint.
+    app.handle_input(b"l");
+    wait_for_render_contains(&mut app, "Cursor     2,0").await;
+    app.handle_input(b"j");
+    wait_for_render_contains(&mut app, "Cursor     2,1").await;
+    app.handle_input(b"k");
+    wait_for_render_contains(&mut app, "Cursor     2,0").await;
+    app.handle_input(b"h");
+    wait_for_render_contains(&mut app, "Cursor     1,0").await;
+    wait_for_render_contains(&mut app, "Mode       view").await;
 
     app.handle_input(b"\x10");
     wait_for_render_contains(&mut app, "Two modes").await;
@@ -2382,14 +2655,14 @@ async fn history_modal_opens_from_command_and_closes_on_esc() {
     );
 }
 
-/// Ctrl+L is the escape hatch for a terminal left damaged by something outside
+/// Ctrl+R is the escape hatch for a terminal left damaged by something outside
 /// late.sh. It has to re-emit every cell: the failure mode worth pinning is a
 /// repaint that clears the screen and then sends an empty diff, leaving the
 /// user staring at a blank terminal that is worse than the damage.
 #[tokio::test]
-async fn ctrl_l_repaints_the_whole_screen_rather_than_blanking_it() {
+async fn ctrl_r_repaints_the_whole_screen_rather_than_blanking_it() {
     let test_db = new_test_db().await;
-    let user = create_test_user(&test_db.db, "ctrl-l-repaint").await;
+    let user = create_test_user(&test_db.db, "ctrl-r-repaint").await;
     let client = test_db.db.get().await.expect("db client");
     let lounge = ChatRoom::ensure_lounge(&client)
         .await
@@ -2397,7 +2670,7 @@ async fn ctrl_l_repaints_the_whole_screen_rather_than_blanking_it() {
     ChatRoomMember::join(&client, lounge.id, user.id)
         .await
         .expect("join lounge room");
-    let mut app = make_app(test_db.db.clone(), user.id, "ctrl-l-repaint-flow-it");
+    let mut app = make_app(test_db.db.clone(), user.id, "ctrl-r-repaint-flow-it");
 
     wait_for_render_contains(&mut app, "lounge").await;
 
@@ -2405,19 +2678,44 @@ async fn ctrl_l_repaints_the_whole_screen_rather_than_blanking_it() {
     let _ = app.render().expect("render");
     let settled = strip_ansi(&String::from_utf8_lossy(&app.render().expect("render")));
 
-    app.handle_input(b"\x0c");
+    app.handle_input(b"\x12");
     let repainted = strip_ansi(&String::from_utf8_lossy(&app.render().expect("render")));
 
     assert!(
         repainted.contains("lounge"),
-        "expected Ctrl+L to re-emit the whole screen; repainted={repainted:?}"
+        "expected Ctrl+R to re-emit the whole screen; repainted={repainted:?}"
     );
     assert!(
         repainted.len() > settled.len(),
-        "expected the Ctrl+L frame to carry more than the settled diff; \
+        "expected the Ctrl+R frame to carry more than the settled diff; \
          settled={} bytes, repainted={} bytes",
         settled.len(),
         repainted.len()
+    );
+}
+
+/// An open chat composer keeps Ctrl+R for itself: it reaches the textarea's
+/// keymap as redo instead of repainting the screen, and the composer stays
+/// open. `/redraw` is the way to repaint from inside one.
+#[tokio::test]
+async fn ctrl_r_in_an_open_composer_redoes_instead_of_repainting() {
+    let (_test_db, mut app) = chat_compose_app("ctrl-r-composer").await;
+
+    app.handle_input(b"abc");
+    assert_eq!(app.chat.composer().lines(), ["abc"]);
+    app.chat.composer_undo();
+    assert_ne!(
+        app.chat.composer().lines(),
+        ["abc"],
+        "undo took something back"
+    );
+
+    app.handle_input(b"\x12");
+    assert!(app.chat.composing, "the composer stays open");
+    assert_eq!(
+        app.chat.composer().lines(),
+        ["abc"],
+        "Ctrl+R redid the undone edit instead of repainting"
     );
 }
 
@@ -3647,6 +3945,18 @@ async fn f_favorites_the_bugs_room_from_the_rail() {
     ChatRoomMember::join(&client, bugs.id, viewer.id)
         .await
         .expect("join bugs");
+    // Seeded before the app starts: a raw insert mid-test is never broadcast,
+    // so it would only render if an unrelated refresh happened to land after it.
+    ChatMessage::create(
+        &client,
+        ChatMessageParams {
+            room_id: bugs.id,
+            user_id: viewer.id,
+            body: "---BUG--- a report to read".to_string(),
+        },
+    )
+    .await
+    .expect("create message");
 
     let mut app = make_app(test_db.db.clone(), viewer.id, "f-fav-bugs-flow-it");
     app.resize(160, 32).expect("resize test terminal");
@@ -3655,6 +3965,7 @@ async fn f_favorites_the_bugs_room_from_the_rail() {
     // Core order is lounge, then bugs: one step right lands on it.
     app.handle_input(b"l");
     assert_eq!(app.chat.selected_room_id, Some(bugs.id));
+    wait_for_render_contains(&mut app, "a report to read").await;
 
     app.handle_input(b"f");
     wait_for_render_contains(&mut app, "Added to favorites").await;
@@ -3667,17 +3978,6 @@ async fn f_favorites_the_bugs_room_from_the_rail() {
 
     // With a message selected, `f` belongs to the reaction leader and never
     // reaches the favorite toggle: the favorite stays exactly as it was.
-    ChatMessage::create(
-        &client,
-        ChatMessageParams {
-            room_id: bugs.id,
-            user_id: viewer.id,
-            body: "---BUG--- a report to read".to_string(),
-        },
-    )
-    .await
-    .expect("create message");
-    wait_for_render_contains(&mut app, "a report to read").await;
     app.handle_input(b"j");
     assert!(app.chat.selected_message_id.is_some());
     app.handle_input(b"f");
@@ -3725,4 +4025,230 @@ async fn f_favorites_the_mentions_entry() {
     app.handle_input(b"f");
     wait_for_render_contains(&mut app, "Removed from favorites").await;
     assert!(!app.chat.favorite_room_ids().contains(&mentions_id));
+}
+
+/// The Chat badges picker lists every badge; a game's ladder is one row, and
+/// hiding it stores every rung so no lower one takes its place.
+#[tokio::test]
+async fn chat_badges_picker_hides_a_whole_game_ladder() {
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, "badge-picker-it").await;
+    let mut app = make_app(test_db.db.clone(), user.id, "badge-picker-flow-it");
+
+    app.handle_input(b"\x0f");
+    wait_for_render_contains(&mut app, "badge-picker-it").await;
+    app.handle_input(b"\t\t\t");
+    wait_for_render_contains(&mut app, "Chat badges").await;
+    wait_for_render_contains(&mut app, "all shown").await;
+    // Tweaks rows: background, brightness, right rail, room rail, composer,
+    // plain glyphs, terminal images, then Chat badges.
+    app.handle_input(b"jjjjjjj\r");
+    // The heading fits the dialog whole, not cut at its border.
+    wait_for_render_contains(&mut app, "Earn it, hide it. Games show their top badge.").await;
+    wait_for_render_contains(&mut app, "LMG LKN LYS LKA").await;
+
+    // Picker rows in label order: the eight monthly rows, then Lateania.
+    app.handle_input(b"jjjjjjjj\r");
+    let db = test_db.db.clone();
+    wait_until(
+        || {
+            let db = db.clone();
+            async move {
+                let client = db.get().await.expect("db client");
+                let stored = User::get(&client, user.id)
+                    .await
+                    .expect("load user")
+                    .expect("user exists");
+                late_core::models::user::extract_hidden_award_categories(&stored.settings)
+                    == vec![
+                        "lateania_archdemon".to_string(),
+                        "lateania_frontier_king".to_string(),
+                        "lateania_sundering_deep".to_string(),
+                        "lateania_kaethyr_ascendant".to_string(),
+                    ]
+            }
+        },
+        "the whole Lateania ladder to be hidden",
+    )
+    .await;
+
+    app.handle_input(b"\x1b");
+    wait_for_render_contains(&mut app, "1 hidden").await;
+}
+
+/// Ctrl+H / Ctrl+L and the wheel over the rail scroll it without changing
+/// room; `l` still changes room, and the rail snaps back to the selection.
+#[tokio::test]
+async fn rail_scroll_keys_and_wheel_leave_the_selected_room_alone() {
+    let test_db = new_test_db().await;
+    let viewer = create_test_user(&test_db.db, "rail-scroll").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, viewer.id)
+        .await
+        .expect("join lounge");
+    // Enough channels that the rail overflows a 32-row terminal.
+    for i in 0..40 {
+        let room = ChatRoom::get_or_create_public_room(&client, &format!("rail-scroll-{i:02}"))
+            .await
+            .expect("create room");
+        ChatRoomMember::join(&client, room.id, viewer.id)
+            .await
+            .expect("join room");
+    }
+
+    let mut app = make_app(test_db.db.clone(), viewer.id, "rail-scroll-flow-it");
+    app.resize(160, 32).expect("resize test terminal");
+    wait_for_render_contains(&mut app, "\u{258C}lounge").await;
+    wait_for_render_contains(&mut app, "rail-scroll-").await;
+    let selected = app.chat.selected_room_id;
+    assert_eq!(app.chat.rail_scroll_nudge(), 0);
+
+    app.handle_input(b"\x0c");
+    assert_eq!(app.chat.selected_room_id, selected, "Ctrl+L changed room");
+    assert_eq!(app.chat.rail_scroll_nudge(), 3);
+    app.handle_input(b"\x0c");
+    assert_eq!(app.chat.rail_scroll_nudge(), 6);
+    app.handle_input(b"\x08");
+    assert_eq!(app.chat.selected_room_id, selected, "Ctrl+H changed room");
+    assert_eq!(app.chat.rail_scroll_nudge(), 3);
+
+    // Wheel down, then up, over the rail (column 5, row 10).
+    app.handle_input(b"\x1b[<65;5;10M");
+    assert_eq!(
+        app.chat.selected_room_id, selected,
+        "the wheel changed room"
+    );
+    assert_eq!(app.chat.rail_scroll_nudge(), 6);
+    app.handle_input(b"\x1b[<64;5;10M");
+    assert_eq!(app.chat.rail_scroll_nudge(), 3);
+
+    // Scrolling up past the top stops there: the next press down moves.
+    for _ in 0..5 {
+        app.handle_input(b"\x08");
+    }
+    assert_eq!(app.chat.rail_scroll_nudge(), 0);
+    app.handle_input(b"\x0c");
+    assert_eq!(app.chat.rail_scroll_nudge(), 3);
+
+    // A space jump centres the rail, even onto the room already selected.
+    app.handle_input(b" a");
+    assert_eq!(app.chat.selected_room_id, selected, "`space a` left lounge");
+    assert_eq!(
+        app.chat.rail_scroll_nudge(),
+        0,
+        "a space jump kept the rail scrolled"
+    );
+    app.handle_input(b"\x0c");
+    assert_eq!(app.chat.rail_scroll_nudge(), 3);
+
+    // `l` moves to the next rail entry (Mentions, after lounge).
+    app.handle_input(b"l");
+    assert_eq!(
+        app.chat.rail_scroll_nudge(),
+        0,
+        "a selection change snaps the rail back to it"
+    );
+    // Returning to the room the rail was scrolled on does not revive the
+    // old scroll: leaving it dropped the nudge for good.
+    app.handle_input(b"h");
+    assert_eq!(
+        app.chat.selected_room_id, selected,
+        "`h` went back to lounge"
+    );
+    assert_eq!(
+        app.chat.rail_scroll_nudge(),
+        0,
+        "coming back to the scrolled room revived its stale scroll"
+    );
+    app.handle_input(b"l");
+
+    // A click on a row of a scrolled rail selects that room and leaves the
+    // rail where it was: the same row under the pointer is still that room,
+    // so a second click there changes nothing. Had the rail re-centred on
+    // the new selection, the row would have moved out from under the click.
+    app.handle_input(b"\x0c");
+    app.handle_input(b"\x0c");
+    assert_eq!(app.chat.rail_scroll_nudge(), 6);
+    let before_click = app.chat.selected_room_id;
+    app.handle_input(b"\x1b[<0;5;22M");
+    let clicked = app.chat.selected_room_id;
+    assert_ne!(
+        clicked, before_click,
+        "the click selected the room under it"
+    );
+    assert!(clicked.is_some(), "the click landed on a room row");
+    app.handle_input(b"\x1b[<0;5;22M");
+    assert_eq!(
+        app.chat.selected_room_id, clicked,
+        "the rail stayed put, so the same row is still the same room"
+    );
+}
+
+#[tokio::test]
+async fn the_first_descent_opens_the_guide_and_the_question_mark_reopens_it() {
+    use crate::app::deadchannel::runner::state::Look;
+    use crate::app::deadchannel::runner::svc::RunnerEntry;
+    use late_core::models::deadchannel_runner::DeadchannelRunner;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let test_db = new_test_db().await;
+    let user = create_test_user(&test_db.db, "undercity-guide-it").await;
+    let client = test_db.db.get().await.expect("db client");
+    let lounge = ChatRoom::ensure_lounge(&client)
+        .await
+        .expect("ensure lounge room");
+    ChatRoomMember::join(&client, lounge.id, user.id)
+        .await
+        .expect("join lounge room");
+    let mut rng = StdRng::seed_from_u64(7);
+    let look = Look::random(1, &mut rng);
+    // The claim is on the row, so the runner needs one.
+    DeadchannelRunner::ensure_for_user(&client, user.id, &look.to_json())
+        .await
+        .expect("a runner");
+    let mut app = make_app(test_db.db.clone(), user.id, "undercity-guide-flow");
+    app.runner_looks = Arc::new(HashMap::from([(
+        user.id,
+        RunnerEntry {
+            look,
+            level: 1,
+            peak_level: 1,
+            marks: 0,
+        },
+    )]));
+
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    // The chrome names the key, and the first descent opens the guide by
+    // itself once the claim answers.
+    wait_for_render_contains(&mut app, " Undercity · ? guide ").await;
+    wait_for_render_contains(&mut app, "the street, explained").await;
+    wait_for_render_contains(&mut app, "arrows or hjkl walk").await;
+
+    // Esc closes it; `?` opens it again from the street; `q` closes it.
+    app.handle_input(b"\x1b");
+    wait_for_render_not_contains(&mut app, "the street, explained").await;
+    app.handle_input(b"?");
+    wait_for_render_contains(&mut app, "the street, explained").await;
+    app.handle_input(b"q");
+    wait_for_render_not_contains(&mut app, "the street, explained").await;
+
+    // A second descent finds the street, not the guide.
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Clubhouse ").await;
+    app.handle_input(b"0");
+    wait_for_render_contains(&mut app, " Undercity ").await;
+    assert_render_not_contains_for(
+        &mut app,
+        "the street, explained",
+        Duration::from_millis(300),
+    )
+    .await;
 }
